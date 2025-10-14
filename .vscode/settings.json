@@ -1,0 +1,7 @@
+{
+    "python.analysis.typeCheckingMode": "standard",
+    "editor.rulers": [
+        80,
+        120
+    ]
+}
