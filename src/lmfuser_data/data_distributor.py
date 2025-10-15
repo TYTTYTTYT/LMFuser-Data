@@ -1,4 +1,4 @@
-from typing import Callable
+from typing import Callable, Generic
 from collections.abc import Iterable, Iterator
 import os
 import logging
@@ -14,7 +14,7 @@ from .utils import split_list
 logger = logging.getLogger(__name__)
 
 
-class DataDistributor:
+class DataDistributor(Generic[ProcessedRow]):
     def __init__(
         self,
         path: str | os.PathLike,
@@ -59,6 +59,8 @@ class DataDistributor:
 
         if self.indexes is not None:
             assert len(self.indexes) == self.num_workers, "indexes must have the same length as num_workers"
+
+        self.last_epoch_row: ProcessedRow | None = None
 
         self.init_workers()
 
@@ -117,8 +119,13 @@ class DataDistributor:
             )
             for worker_idx in range(self.num_workers)
         ]
-
         logger.info(f"Initialized {self.num_workers} workers.")
+
+        self.worker_pointer = 0
+
+    def _try_init_workers(self) -> None:
+        if not hasattr(self, 'workers'):
+            self.init_workers()
 
     @property
     def epoch(self) -> int:
@@ -126,5 +133,33 @@ class DataDistributor:
         return max(epoches)
 
     def __iter__(self) -> Iterator[ProcessedRow]:
+        iters = [iter(worker) for worker in self.workers]
+        current_epoch = self.epoch
+        while True:
+            if self.last_epoch_row is not None:
+                yield self.last_epoch_row
+                self.last_epoch_row = None
+            for worker_pointer in list(range(self.worker_pointer, len(self.workers))):
+                self.worker_pointer = worker_pointer
+                try:
+                    row = next(iters[worker_pointer])
+                except StopIteration:
+                    iters[worker_pointer] = iter(self.workers[worker_pointer])
+                    row = next(iters[worker_pointer])
+
+                if self.epoch > current_epoch:
+                    self.last_epoch_row = row
+                    self.worker_pointer += 1
+                    if self.worker_pointer >= len(self.workers):
+                        self.worker_pointer = 0
+                    return
+
+                yield row
+            self.worker_pointer = 0
+
+    def reset_iter(self) -> None:
+        self.last_epoch_row = None
+        self.worker_pointer = 0
+        self._try_init_workers()
         for worker in self.workers:
-            yield from worker
+            worker.reset_iter()

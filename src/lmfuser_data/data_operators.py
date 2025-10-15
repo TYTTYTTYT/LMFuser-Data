@@ -33,25 +33,32 @@ class Reader(Generic[Row]):
         self.epoch_path_list = path_list.copy()
         self.idx_list: list[int] | None = None
 
+    def set_scanner(self, index: Index) -> None:
+        if index.part >= len(self.path_list):
+            raise IndexError(f"Part index {index.part} out of range.")
+        if self.shuffle:
+            path_list = self.path_list.copy()
+            path_list.sort()
+            rand = random.Random(':'.join([str(self.seed), str(index.epoch)]))
+            rand.shuffle(path_list)
+            self.epoch_path_list = path_list
+        path = self.epoch_path_list[index.part]
+        logger.info(f'Loading data from {path}...')
+        self.current_scanner = self.scanner_type(path)
+        logger.info(f'Data loaded from {path}, total {len(self.current_scanner)} rows.')
+
+        self.idx_list = list(range(len(self.current_scanner)))
+        if self.shuffle:
+            rand = random.Random(':'.join([str(self.seed), str(index.epoch), str(index.part)]))
+            rand.shuffle(self.idx_list)
+
+        self.index.part = index.part
+        self.index.epoch = index.epoch
+        self.index.row = index.row
+
     def _try_set_scanner(self, index: Index) -> None:
         if self.current_scanner is None or self.index.part != index.part or self.index.epoch != index.epoch:
-            if index.part >= len(self.path_list):
-                raise IndexError(f"Part index {index.part} out of range.")
-            if self.shuffle:
-                path_list = self.path_list.copy()
-                path_list.sort()
-                rand = random.Random(':'.join([str(self.seed), str(index.epoch)]))
-                rand.shuffle(path_list)
-                self.epoch_path_list = path_list
-            path = self.epoch_path_list[index.part]
-            logger.info(f'Loading data from {path}...')
-            self.current_scanner = self.scanner_type(path)
-            logger.info(f'Data loaded from {path}, total {len(self.current_scanner)} rows.')
-
-            self.idx_list = list(range(len(self.current_scanner)))
-            if self.shuffle:
-                rand = random.Random(':'.join([str(self.seed), str(index.epoch), str(index.part)]))
-                rand.shuffle(self.idx_list)
+            self.set_scanner(index)
 
         self.index.part = index.part
         self.index.epoch = index.epoch
@@ -67,15 +74,15 @@ class Reader(Generic[Row]):
         while True:
             self._try_set_scanner(self.index)
             assert self.current_scanner is not None
-            for _ in range(self.index.part, len(self.path_list)):
+            assert self.idx_list is not None
+            for part_idx in range(self.index.part, len(self.path_list)):
+                self._try_set_scanner(Index(self.index.epoch, part_idx, self.index.row))
                 for row_idx in range(self.index.row, len(self.current_scanner)):
-                    yield self.current_scanner[row_idx]
+                    yield self.current_scanner[self.idx_list[row_idx]]
                     self.index.row += 1
-                self.index.part += 1
                 self.index.row = 0
 
-            self.index.epoch += 1
-            self.index.part = 0
+            self._try_set_scanner(Index(self.index.epoch + 1, 0, 0))
 
             if not self.infinite:
                 break
