@@ -1,4 +1,6 @@
 from typing import TypeVar
+from collections.abc import Iterable, Iterator, Sequence
+from random import Random
 import logging
 
 
@@ -62,3 +64,27 @@ def split_list(data_list: list[T], num_shards: int) -> list[list[T]]:
         start_index = end_index
         
     return shards
+
+def mix_iterables(iterables: Sequence[Iterable[T]], weights: list[float], rng: Random) -> Iterator[T]:
+    """
+    Mixes elements from multiple iterables randomly according to weights.
+
+    Args:
+        iterables (list[Iterable[T]]): A list of iterables to mix.
+        weights (list[float]): A list of weights corresponding to each iterable.
+        rng (Random): A random number generator.
+
+    Yields:
+        T: Elements from the input iterables in a mixed order.
+    """
+    assert len(iterables) == len(weights), "Number of iterables must be equal to number of weights."
+    iters = [iter(iterable) for iterable in iterables]
+    ids = list(range(len(iters)))
+
+    while True:
+        idx = rng.choices(list(ids), weights=weights, k=1)[0]
+        try:
+            yield next(iters[idx])
+        except StopIteration:
+            iters[idx] = iter(iterables[idx])
+            yield next(iters[idx])

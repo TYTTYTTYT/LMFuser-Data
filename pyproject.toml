@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling >= 1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lmfuser-data"
+version = "0.0.1"
+requires-python = ">= 3.10"
+description = "The data accessing and processing infrastructure for LMFuser"
+readme = "README.md"
+keywords = ["dataloader", "qps", "process pool", "parallel", "machine learning", "pytorch"]
+classifiers = [
+  "Topic :: Utilities",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Database :: Database Engines/Servers",
+  "Topic :: Database",
+  "Intended Audience :: Science/Research",
+  "Intended Audience :: Information Technology"
+]
+dependencies = [
+  "numpy",
+  "pandas",
+  "pyarrow",
+  "torch",
+]
+authors = [
+  {name = "Yintao Tai", email = "tai.yintao@gmail.com"},
+]
+maintainers = [
+  {name = "Yintao Tai", email = "tai.yintao@gmail.com"},
+]
+
+[project.urls]
+Homepage = "https://github.com/TYTTYTTYT/LMFuser-data"
+"Bug Tracker" = "https://github.com/TYTTYTTYT/LMFuser-data"
+Documentation = "https://github.com/TYTTYTTYT/LMFuser-data"
+Repository = "https://github.com/TYTTYTTYT/LMFuser-data"
+Changelog = "https://github.com/TYTTYTTYT/LMFuser-data"

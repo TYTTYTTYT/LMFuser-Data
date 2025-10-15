@@ -1,6 +1,6 @@
 from typing import TypeVar, Protocol, TypedDict
 from dataclasses import dataclass
-from collections.abc import Iterable, Hashable
+from collections.abc import Iterable, Hashable, Sequence, Mapping
 
 from torch import Tensor
 from numpy import ndarray
@@ -12,8 +12,10 @@ class RowBase(TypedDict):
     """
 
 T = TypeVar("T", bound="SubclassTracer")
+R = TypeVar("R")
+
 Row = TypeVar("Row", bound=RowBase)
-Batch = dict[Hashable, list[Row] | Tensor | ndarray]
+Batch = Mapping[Hashable, Sequence[R] | Tensor | ndarray]
 
 
 class SubclassTracer:
