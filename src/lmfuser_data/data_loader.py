@@ -7,6 +7,7 @@ import os
 import torch
 from torch import Tensor
 import numpy as np
+from cloudpickle import pickle
 
 from .data_operators import ProcessedRow, MappedRow
 from .data_distributor import DataDistributor
@@ -61,8 +62,8 @@ class DataLoader:
     def __init__(
         self,
         batch_size: int,
-        path_list: list[str | os.PathLike],
-        scanner_type: type[Scanner[Row]],
+        path_list: Sequence[str | os.PathLike],
+        scanner_type: type[Scanner[Row]] | str,
         seed: int,
         shuffle: bool,
         pre_fetch_factor: int = 0,
@@ -81,6 +82,8 @@ class DataLoader:
         batch_map_fn: Callable[[Batch[T]], Batch[R]] | None = None,
         distributor_weights: list[float] | None = None,
     ) -> None:
+        if isinstance(scanner_type, str):
+            scanner_type = Scanner.get_subclass(scanner_type)
         self.distributors = [
             DataDistributor(
                 path=path,
@@ -131,7 +134,7 @@ class DataLoader:
         if distributor_weights is None:
             self.distributor_weights = [1.0] * len(self.distributors)
         else:
-            assert len(self.distributors) == len(self.distributor_weights), \
+            assert len(self.distributors) == len(distributor_weights), \
                 "The number of distributors and weights must be the same."
             self.distributor_weights = distributor_weights
 
@@ -168,3 +171,36 @@ class DataLoader:
             self.current_batch.append(row)
             if self.epoch > current_epoch:
                 break
+
+    def current_index(self) -> list[list[Index]]:
+        return [[worker.index for worker in distriubtor.workers] for distriubtor in self.distributors]
+
+    def states(self) -> bytes:
+        return pickle.dumps({
+            'batch_size': self.batch_size,
+            'path_list': self.distributors[0].path,
+            'scanner_type': self.distributors[0].scanner_type,
+            'seed': self.seed,
+            'shuffle': self.distributors[0].shuffle,
+            'pre_fetch_factor': self.distributors[0].pre_fetch_factor,
+            'indexes': self.current_index(),
+            'infinite': self.distributors[0].infinite,
+            'map_fn': self.distributors[0].map_fn,
+            'flow_fn': self.distributors[0].flow_fn,
+            'ignore_error': self.ignore_error,
+            'qps': self.distributors[0].qps,
+            'instruct_timeout': self.distributors[0].instruct_timeout,
+            'worker_timeout': self.distributors[0].worker_timeout,
+            'restart_cnt': self.distributors[0].restart_cnt,
+            'num_workers': self.distributors[0].num_workers,
+            'num_ranks': self.distributors[0].num_distributors,
+            'rank_idx': self.distributors[0].distributor_idx,
+            'batch_map_fn': self.batch_map_fn,
+            'distributor_weights': self.distributor_weights,
+        })
+
+    @classmethod
+    def from_states(cls, states: bytes) -> 'DataLoader':
+        states = pickle.loads(states)
+        assert isinstance(states, dict)
+        return DataLoader(**states) # type: ignore

@@ -106,3 +106,14 @@ class Index:
     epoch: int = 0
     part: int = 0
     row: int = 0
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            'epoch': self.epoch,
+            'part': self.part,
+            'row': self.row,
+        }
+
+    @classmethod
+    def from_dict(cls, states: dict[str, int]) -> 'Index':
+        return cls(**states)

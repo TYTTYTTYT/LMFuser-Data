@@ -3,10 +3,13 @@ from io import BytesIO
 import json
 import requests
 import gzip
+import logging
 
 from .interface import Scanner
 from ..interfaces import Row, RowBase
+from ..utils import retry
 
+logger = logging.getLogger(__name__)
 
 class C4Row(RowBase):
     text: str
@@ -24,6 +27,7 @@ class C4Scanner(Scanner[C4Row]):
         super().__init__(path, **kwargs)
         self._lines: list[str] | None = None
 
+    @retry(tries=10, delay=0.1, backoff=2, logger=logger)
     def _load_data(self) -> None:
         if self._lines is not None:
             return

@@ -1,8 +1,9 @@
-from typing import TypeVar
+from typing import Any, Callable, TypeVar, cast
 from collections.abc import Iterable, Iterator, Sequence
 from random import Random
 import logging
-
+import time
+from functools import wraps
 
 logger = logging.getLogger(__name__)
 
@@ -88,3 +89,46 @@ def mix_iterables(iterables: Sequence[Iterable[T]], weights: list[float], rng: R
         except StopIteration:
             iters[idx] = iter(iterables[idx])
             yield next(iters[idx])
+
+# A TypeVar is used to represent the generic type of the function being decorated.
+F = TypeVar('F', bound=Callable[..., Any])
+
+def retry(
+    tries: int = 4,
+    delay: int | float = 3,
+    backoff: int | float = 2,
+    logger: logging.Logger | None = None
+) -> Callable[[F], F]:
+    """
+    A retry decorator with exponential backoff.
+
+    :param tries: The maximum number of attempts.
+    :param delay: Initial delay between retries in seconds.
+    :param backoff: Multiplier for the delay after each failure.
+    :param logger: Logger to use for output. If None, prints to console.
+    """
+
+    def deco_retry(f: F) -> F:
+        @wraps(f)
+        def f_retry(*args: Any, **kwargs: Any) -> Any:
+            mtries, mdelay = tries, delay
+            while mtries > 1:
+                try:
+                    return f(*args, **kwargs)
+                except Exception as e:
+                    msg = f"Function '{f.__name__}' failed with exception: {e}. Retrying in {mdelay} seconds..."
+                    if logger:
+                        logger.warning(msg)
+                    else:
+                        print(msg)
+                    time.sleep(mdelay)
+                    mtries -= 1
+                    mdelay *= backoff
+            # Final attempt
+            return f(*args, **kwargs)
+
+        # Cast the wrapper function to the same type as the decorated function
+        # to help static type checkers understand the code.
+        return cast(F, f_retry)
+
+    return deco_retry
