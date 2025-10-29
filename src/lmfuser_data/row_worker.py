@@ -1,4 +1,4 @@
-from typing import Generic, TypeVar, Callable
+from typing import Callable
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 import os
@@ -8,8 +8,9 @@ import signal
 from copy import deepcopy
 
 from torch.multiprocessing import Queue, Process
+import psutil
 
-from .interfaces import Row, RowBase, Index
+from .interfaces import Row, Index
 from .scanners import Scanner
 from .data_operators import Index, Reader, DataFlow
 
@@ -51,15 +52,13 @@ class WorkerInfo(WorkerResult):
 
 
 @dataclass(frozen=True)
-class RowResult(WorkerResult, Generic[Row]):
+class RowResult(WorkerResult):
     row: Row
 
-MappedRow = TypeVar("MappedRow", bound=RowBase)
-ProcessedRow = TypeVar("ProcessedRow", bound=RowBase)
 
 def _worker_loop(
     path_list: list[str],
-    scanner_type: type[Scanner[Row]],
+    scanner_type: type[Scanner],
     seed: int,
     shuffle: bool,
     instruct_queue: Queue,
@@ -67,8 +66,8 @@ def _worker_loop(
     index_queue: Queue,
     index: Index | None = None,
     infinite: bool = False,
-    map_fn: Callable[[Row], MappedRow] | None = None,
-    flow_fn: Callable[[Iterable[MappedRow]], Iterable[ProcessedRow]] | None = None,
+    map_fn: Callable[[Row], Row] | None = None,
+    flow_fn: Callable[[Iterable[Row]], Iterable[Row]] | None = None,
     ignore_error: bool = False,
     qps: float | None = None,
     instruct_timeout: float | None = 600.0,
@@ -110,7 +109,7 @@ def _worker_loop(
                         last_time = time.time()
                     row = next(stream)
                     if not isinstance(row, Exception):
-                        result_queue.put(RowResult[ProcessedRow](row))
+                        result_queue.put(RowResult(row))
                         index_queue.put(deepcopy(reader.index))
                         break
                     else:
@@ -129,7 +128,7 @@ def _worker_loop(
                         last_time = time.time()
                     row = next(stream)
                     if not isinstance(row, Exception):
-                        result_queue.put(RowResult[ProcessedRow](row))
+                        result_queue.put(RowResult(row))
                         index_queue.put(deepcopy(reader.index))
                         break
                     else:
@@ -147,7 +146,6 @@ def force_kill(pid: int):
         print(f"Killed process {pid} with SIGKILL")
     except AttributeError:
         # On Windows, no SIGKILL constant — fallback to TerminateProcess
-        import psutil
         p = psutil.Process(pid)
         p.kill()
         print(f"Killed process {pid} using psutil")
@@ -157,18 +155,18 @@ def force_kill(pid: int):
         print(f"No permission to kill {pid}")
 
 
-class RowWorker(Generic[ProcessedRow]):
+class RowWorker:
     def __init__(
         self,
         path_list: list[str],
-        scanner_type: type[Scanner[Row]],
+        scanner_type: type[Scanner],
         seed: int,
         shuffle: bool,
         pre_fetch_factor: int = 0,
         index: Index | None = None,
         infinite: bool = False,
-        map_fn: Callable[[Row], MappedRow] | None = None,
-        flow_fn: Callable[[Iterable[MappedRow]], Iterable[ProcessedRow]] | None = None,
+        map_fn: Callable[[Row], Row] | None = None,
+        flow_fn: Callable[[Iterable[Row]], Iterable[Row]] | None = None,
         ignore_error: bool = False,
         qps: float | None = None,
         instruct_timeout: float | None = 600.0,
@@ -195,7 +193,7 @@ class RowWorker(Generic[ProcessedRow]):
 
         self._start_worker()
 
-        self.last_epoch_row: ProcessedRow | None = None
+        self.last_epoch_row: Row | None = None
         self.last_epoch_idx: Index | None = None
 
     def _start_worker(self) -> None:
@@ -241,7 +239,7 @@ class RowWorker(Generic[ProcessedRow]):
         if not self.check_alive():
             self._start_worker()
 
-    def seek(self, index: Index) -> ProcessedRow:
+    def seek(self, index: Index) -> Row:
         self._try_start()
         try:
             self.instruct_queue.put(Seek(index.epoch, index.part, index.row), timeout=self.worker_timeout)
@@ -284,7 +282,7 @@ class RowWorker(Generic[ProcessedRow]):
             logger.error(f"Worker timed out waiting for reset iter instruction: {e}")
             raise e
 
-    def __iter__(self) -> Iterator[ProcessedRow]:
+    def __iter__(self) -> Iterator[Row]:
         self._try_start()
         cur_epoch = self.index.epoch
         while self.queue_size < self.pre_fetch_factor:

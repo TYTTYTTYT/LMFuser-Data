@@ -6,18 +6,13 @@ import gzip
 import logging
 
 from .interface import Scanner
-from ..interfaces import Row, RowBase
+from ..interfaces import Row
 from ..utils import retry
 
 logger = logging.getLogger(__name__)
 
-class C4Row(RowBase):
-    text: str
-    timestamp: str
-    url: str
 
-
-class C4Scanner(Scanner[C4Row]):
+class C4Scanner(Scanner):
     """
     C4Scanner is a scanner for C4 files.
     It provides the basic interface for scanning a single file.
@@ -42,24 +37,24 @@ class C4Scanner(Scanner[C4Row]):
         with gzip.open(BytesIO(content), mode='rt', encoding='utf-8') as f:
             self._lines = f.readlines()
 
-    def __getitem__(self, index: int) -> C4Row:
+    def __getitem__(self, index: int) -> Row:
         self._load_data()
         assert self._lines is not None, 'Data not properly loaded'
 
         line = self._lines[index]
         row = json.loads(line)
-        return C4Row(
-            text=str(row['text']),
-            timestamp=str(row['timestamp']),
-            url=str(row['url'])
-        )
+        return {
+            'text': str(row['text']),
+            'timestamp': str(row['timestamp']),
+            'url': str(row['url'])
+        }
 
     def __len__(self) -> int:
         self._load_data()
         assert self._lines is not None, 'Data not properly loaded'
         return len(self._lines)
 
-    def __iter__(self) -> Iterator[C4Row]:
+    def __iter__(self) -> Iterator[Row]:
         for idx in range(len(self)):
             yield self[idx]
 

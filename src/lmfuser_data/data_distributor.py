@@ -7,25 +7,24 @@ import requests
 
 from .row_worker import RowWorker
 from .interfaces import Row, Index
-from .data_operators import MappedRow, ProcessedRow
 from .scanners import Scanner
 from .utils import split_list
 
 logger = logging.getLogger(__name__)
 
 
-class DataDistributor(Generic[ProcessedRow]):
+class DataDistributor:
     def __init__(
         self,
         path: str | os.PathLike,
-        scanner_type: type[Scanner[Row]],
+        scanner_type: type[Scanner],
         seed: int,
         shuffle: bool,
         pre_fetch_factor: int = 0,
         indexes: list[Index] | None = None,
         infinite: bool = False,
-        map_fn: Callable[[Row], MappedRow] | None = None,
-        flow_fn: Callable[[Iterable[MappedRow]], Iterable[ProcessedRow]] | None = None,
+        map_fn: Callable[[Row], Row] | None = None,
+        flow_fn: Callable[[Iterable[Row]], Iterable[Row]] | None = None,
         ignore_error: bool = False,
         qps: float | None = None,
         instruct_timeout: float | None = 600.0,
@@ -60,7 +59,7 @@ class DataDistributor(Generic[ProcessedRow]):
         if self.indexes is not None:
             assert len(self.indexes) == self.num_workers, "indexes must have the same length as num_workers"
 
-        self.last_epoch_row: ProcessedRow | None = None
+        self.last_epoch_row: Row | None = None
 
         self.init_workers()
 
@@ -132,7 +131,7 @@ class DataDistributor(Generic[ProcessedRow]):
         epoches = [worker.index.epoch for worker in self.workers]
         return max(epoches)
 
-    def __iter__(self) -> Iterator[ProcessedRow]:
+    def __iter__(self) -> Iterator[Row]:
         iters = [iter(worker) for worker in self.workers]
         current_epoch = self.epoch
         while True:

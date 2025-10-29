@@ -9,7 +9,6 @@ from torch import Tensor
 import numpy as np
 from cloudpickle import pickle
 
-from .data_operators import ProcessedRow, MappedRow
 from .data_distributor import DataDistributor
 from .interfaces import Batch, Row, Index
 from .utils import mix_iterables
@@ -34,7 +33,7 @@ def _try_stack(value_list: list[T]) -> Tensor | list[T]:
     else:
         return value_list
 
-def _collate_fn(rows: Sequence[Row]) -> Batch[MappedRow]:
+def _collate_fn(rows: Sequence[Row]) -> Batch:
     """
     Default collate function that returns a Batch from a list of Rows.
     This can be overridden by the user to provide custom collation logic.
@@ -51,7 +50,7 @@ def _collate_fn(rows: Sequence[Row]) -> Batch[MappedRow]:
                     batch[key].append(None)
             batch[key].append(value)
 
-    result: Batch[MappedRow] = {}
+    result: Batch = {}
     for key, v_lst in batch.items():
         result[key] = _try_stack(v_lst)
 
@@ -63,14 +62,14 @@ class DataLoader:
         self,
         batch_size: int,
         path_list: Sequence[str | os.PathLike],
-        scanner_type: type[Scanner[Row]] | str,
+        scanner_type: type[Scanner] | str,
         seed: int,
         shuffle: bool,
         pre_fetch_factor: int = 0,
         indexes: list[list[Index]] | None = None,
         infinite: bool = False,
-        map_fn: Callable[[Row], MappedRow] | None = None,
-        flow_fn: Callable[[Iterable[MappedRow]], Iterable[ProcessedRow]] | None = None,
+        map_fn: Callable[[Row], Row] | None = None,
+        flow_fn: Callable[[Iterable[Row]], Iterable[Row]] | None = None,
         ignore_error: bool = False,
         qps: float | None = None,
         instruct_timeout: float | None = 600.0,
@@ -79,7 +78,7 @@ class DataLoader:
         num_workers: int = 1,
         num_ranks: int = 1,
         rank_idx: int = 0,
-        batch_map_fn: Callable[[Batch[T]], Batch[R]] | None = None,
+        batch_map_fn: Callable[[Batch], Batch] | None = None,
         distributor_weights: list[float] | None = None,
     ) -> None:
         if isinstance(scanner_type, str):

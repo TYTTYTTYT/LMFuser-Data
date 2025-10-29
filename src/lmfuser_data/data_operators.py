@@ -3,7 +3,7 @@ import logging
 import random
 
 from .scanners import Scanner
-from .interfaces import Row, Index, SubclassTracer, RowBase
+from .interfaces import Row, Index, SubclassTracer
 
 logger = logging.getLogger(__name__)
 
@@ -12,10 +12,10 @@ class NotCountableError(Exception):
     ...
 
 
-class Reader(Generic[Row]):
+class Reader:
     def __init__(
         self, 
-        scanner_type: type[Scanner[Row]], 
+        scanner_type: type[Scanner], 
         path_list: list[str], 
         seed: int,
         shuffle: bool,
@@ -29,7 +29,7 @@ class Reader(Generic[Row]):
         self.index = index if index is not None else Index(0, 0, 0)
         self.infinite = infinite
 
-        self.current_scanner: Scanner[Row] | None = None
+        self.current_scanner: Scanner | None = None
         self.epoch_path_list = path_list.copy()
         self.idx_list: list[int] | None = None
 
@@ -107,16 +107,13 @@ class RowMapFunctionError(Exception):
 class RowFlowFunctionError(Exception):
     ...
 
-MappedRow = TypeVar("MappedRow", bound=RowBase)
-ProcessedRow = TypeVar("ProcessedRow", bound=RowBase)
 
-
-class FlowIterator(Iterator[ProcessedRow | RowMapFunctionError | RowFlowFunctionError]):
+class FlowIterator(Iterator[Row | RowMapFunctionError | RowFlowFunctionError]):
     def __init__(
         self, 
         source: Iterator[Row],
-        map_fn: Callable[[Row], MappedRow], 
-        flow_fn: Callable[[Iterable[MappedRow]], Iterable[ProcessedRow]],
+        map_fn: Callable[[Row], Row], 
+        flow_fn: Callable[[Iterable[Row]], Iterable[Row]],
         allow_error: bool = False
     ) -> None:
         self.source = source
@@ -124,11 +121,11 @@ class FlowIterator(Iterator[ProcessedRow | RowMapFunctionError | RowFlowFunction
         self.flow_fn = flow_fn
         self.allow_error = allow_error
 
-    def __next__(self) -> ProcessedRow | RowMapFunctionError | RowFlowFunctionError:
+    def __next__(self) -> Row | RowMapFunctionError | RowFlowFunctionError:
         def _map_stream(
             source: Iterator[Row], 
-            map_fn: Callable[[Row], MappedRow]
-        ) -> Iterator[MappedRow]:
+            map_fn: Callable[[Row], Row]
+        ) -> Iterator[Row]:
             while True:
                 try:
                     row = next(source)
@@ -162,7 +159,7 @@ class FlowIterator(Iterator[ProcessedRow | RowMapFunctionError | RowFlowFunction
 
 class DataFlow(
     SubclassTracer, 
-    Iterable[ProcessedRow | RowMapFunctionError | RowFlowFunctionError], 
+    Iterable[Row | RowMapFunctionError | RowFlowFunctionError], 
 ):
     """
     DataFlow is a class that provides a unified interface for data processing.
@@ -171,9 +168,9 @@ class DataFlow(
 
     def __init__(
         self,
-        reader: Reader[Row],
-        map_fn: Callable[[Row], MappedRow] | None = None,
-        flow_fn: Callable[[Iterable[MappedRow]], Iterable[ProcessedRow]] | None = None,
+        reader: Reader,
+        map_fn: Callable[[Row], Row] | None = None,
+        flow_fn: Callable[[Iterable[Row]], Iterable[Row]] | None = None,
         ignore_error: bool = False
     ) -> None:
         super().__init__()
@@ -184,12 +181,12 @@ class DataFlow(
             self._is_countable = False
 
         if map_fn is None:
-            self.map_fn: Callable[[Row], MappedRow] = lambda x: x # type: ignore
+            self.map_fn: Callable[[Row], Row] = lambda x: x
         else:
             self.map_fn = map_fn
 
         if flow_fn is None:
-            self.flow_fn: Callable[[Iterable[MappedRow]], Iterable[ProcessedRow]] = lambda x: x # type: ignore
+            self.flow_fn: Callable[[Iterable[Row]], Iterable[Row]] = lambda x: x
         else:
             self.flow_fn = flow_fn
             self._is_countable = False
@@ -204,8 +201,8 @@ class DataFlow(
         """
         return self._is_countable
 
-    def __iter__(self) -> Iterator[ProcessedRow | RowMapFunctionError | RowFlowFunctionError]:
-        return FlowIterator[ProcessedRow](
+    def __iter__(self) -> Iterator[Row | RowMapFunctionError | RowFlowFunctionError]:
+        return FlowIterator(
             source=iter(self.reader),
             map_fn=self.map_fn,
             flow_fn=self.flow_fn,
@@ -217,7 +214,7 @@ class DataFlow(
             raise NotCountableError("DataFlow is not countable now.")
         return len(self.reader)
 
-    def seek(self, index: Index) -> ProcessedRow | RowMapFunctionError | RowFlowFunctionError:
+    def seek(self, index: Index) -> Row | RowMapFunctionError | RowFlowFunctionError:
         if not self.is_countable():
             raise NotCountableError("DataFlow is not countable so cannot get row by index.")
         raw_row = self.reader.seek(index)

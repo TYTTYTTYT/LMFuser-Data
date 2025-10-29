@@ -4,8 +4,6 @@ from collections.abc import Iterable, Iterator
 
 from ..interfaces import SubclassTracer, Row
 
-R = TypeVar('R')
-
 
 class Scanner(ABC, SubclassTracer, Iterable[Row]):
     """
