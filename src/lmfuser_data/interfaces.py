@@ -1,4 +1,4 @@
-from typing import TypeVar, Protocol, TypedDict
+from typing import TypeVar, Protocol
 from dataclasses import dataclass
 from collections.abc import Iterable, Hashable, Sequence, Mapping
 from typing import Any

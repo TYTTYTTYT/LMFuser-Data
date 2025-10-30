@@ -1,4 +1,4 @@
-from typing import Iterable, Iterator, Callable, Generic, TypeVar
+from typing import Iterable, Iterator, Callable
 import logging
 import random
 

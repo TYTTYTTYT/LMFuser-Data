@@ -2,11 +2,10 @@ from typing import Literal
 
 from .interface import Scanner
 from .c4 import C4Scanner
-
-SCANNER_NAMES = Literal['C4Scanner']
+from .arrow import ArrowScanner
 
 __all__ = [
-    'SCANNER_NAMES',
     'Scanner',
-    'C4Scanner'
+    'C4Scanner',
+    'ArrowScanner'
 ]

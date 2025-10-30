@@ -1,4 +1,4 @@
-from typing import Callable, Generic
+from typing import Callable
 from collections.abc import Iterable, Iterator
 import os
 import logging
