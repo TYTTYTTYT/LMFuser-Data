@@ -1,4 +1,4 @@
-from typing import Callable, TypedDict, Literal
+from typing import Callable, Literal
 from collections.abc import Iterable, Sequence
 import tempfile
 import os
@@ -7,9 +7,8 @@ import torch.distributed as dist
 from cloudpickle import pickle
 
 from ..data_loader import DataLoader, R, T
-from ..interfaces import Index, Batch
-from ..data_operators import ProcessedRow, MappedRow
-from ..scanners import C4Scanner, C4Row
+from ..interfaces import Index, Batch, Row
+from ..scanners import C4Scanner
 
 DATA_URL = "https://huggingface.co/datasets/allenai/c4/resolve/1ddc917116b730e1859edef32896ec5c16be51d0/multilingual/c4-{language}{split_suffix}.tfrecord-{index:05d}-of-{n_shards:05d}.json.gz"
 
@@ -254,9 +253,9 @@ def init_c4_dataloader(
     num_workers: int = 1,
     ignore_error: bool = False,
     qps: float | None = None,
-    map_fn: Callable[[C4Row], MappedRow] | None = None,
-    flow_fn: Callable[[Iterable[MappedRow]], Iterable[ProcessedRow]] | None = None,
-    batch_map_fn: Callable[[Batch[T]], Batch[R]] | None = None,
+    map_fn: Callable[[Row], Row] | None = None,
+    flow_fn: Callable[[Iterable[Row]], Iterable[Row]] | None = None,
+    batch_map_fn: Callable[[Batch], Batch] | None = None,
     indexes: list[list[Index]] | None = None,
     instruct_timeout: float | None = 600.0,
     worker_timeout: float | None = 600.0,

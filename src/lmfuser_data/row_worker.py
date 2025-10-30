@@ -12,7 +12,7 @@ import psutil
 
 from .interfaces import Row, Index
 from .scanners import Scanner
-from .data_operators import Index, Reader, DataFlow
+from .data_operators import Index, ShardedReader, DataFlow
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +72,7 @@ def _worker_loop(
     qps: float | None = None,
     instruct_timeout: float | None = 600.0,
 ):
-    reader = Reader(scanner_type, path_list, seed, shuffle, index, infinite)
+    reader = ShardedReader(scanner_type, path_list, seed, shuffle, index, infinite)
     data_flow = DataFlow(reader, map_fn, flow_fn, ignore_error)
     stream = iter(data_flow)
 

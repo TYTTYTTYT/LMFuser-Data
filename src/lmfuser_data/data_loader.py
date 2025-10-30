@@ -8,11 +8,14 @@ import torch
 from torch import Tensor
 import numpy as np
 from cloudpickle import pickle
+from torch.utils.data import DistributedSampler
+from torch.utils.data import DataLoader as Loader
 
 from .data_distributor import DataDistributor
 from .interfaces import Batch, Row, Index
 from .utils import mix_iterables
 from .scanners import Scanner
+from .data_operators import CombinedReader
 
 logger = logging.getLogger(__name__)
 
@@ -203,3 +206,76 @@ class DataLoader:
         states = pickle.loads(states)
         assert isinstance(states, dict)
         return DataLoader(**states) # type: ignore
+
+
+class PyTorchDataLoader:
+    def __init__(
+        self,
+        batch_size: int,
+        path_list: Sequence[str | os.PathLike],
+        scanner_type: type[Scanner] | str,
+        seed: int,
+        shuffle: bool,
+        pre_fetch_factor: int = 0,
+        num_workers: int = 1,
+        num_ranks: int = 1,
+        rank_idx: int = 0,
+        collate_fn: Callable[[list[Row]], Batch] | None = None,
+        drop_last: bool = False
+    ) -> None:
+        self.batch_size = batch_size
+        self.path_list = path_list
+        if isinstance(scanner_type, str):
+            self.scanner_type = Scanner.get_subclass(scanner_type)
+        else:
+            self.scanner_type = scanner_type
+        self.seed = seed
+        self.shuffle = shuffle
+        self.pre_fetch_factor = pre_fetch_factor
+        self.num_workers = num_workers
+        self.num_ranks = num_ranks
+        self.rank_idx = rank_idx
+        self.collate_fn = collate_fn
+        self.drop_last = drop_last
+
+        self.dataset = CombinedReader(scanner_type=self.scanner_type, path_list=self.path_list) # type: ignore
+        if num_ranks > 1:
+            sampler = DistributedSampler(
+                self.dataset,  # type: ignore
+                num_replicas=num_ranks, 
+                rank=rank_idx, 
+                shuffle=shuffle, 
+                seed=seed, 
+                drop_last=drop_last
+            )
+            dataloader = Loader(
+                dataset=self.dataset, # type: ignore
+                batch_size=batch_size,
+                sampler=sampler,
+                num_workers=num_workers,
+                pin_memory=True,
+                drop_last=drop_last,
+                prefetch_factor=pre_fetch_factor,
+                collate_fn=collate_fn,
+                generator=torch.Generator().manual_seed(seed)
+            )
+        else:
+            dataloader = Loader(
+                dataset=self.dataset, # type: ignore
+                batch_size=batch_size,
+                shuffle=shuffle,
+                num_workers=num_workers,
+                pin_memory=True,
+                drop_last=drop_last,
+                prefetch_factor=pre_fetch_factor,
+                collate_fn=collate_fn,
+                generator=torch.Generator().manual_seed(seed)
+            )
+
+        self.dataloader = dataloader
+
+    def __iter__(self) -> Iterator[Batch]:
+        return self.dataloader.__iter__()
+
+    def __len__(self) -> int:
+        return self.dataloader.__len__()

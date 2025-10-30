@@ -1,5 +1,5 @@
-from .scanners import Scanner, C4Scanner, ArrowScanner
-from .data_loader import DataLoader
+from .scanners import Scanner, C4Scanner, ArrowScanner, ParquetScanner
+from .data_loader import DataLoader, PyTorchDataLoader
 from .interfaces import Row, Batch
 
 __all__ = [
@@ -8,5 +8,7 @@ __all__ = [
     'Scanner',
     'DataLoader',
     'C4Scanner',
-    'ArrowScanner'
+    'ArrowScanner',
+    'ParquetScanner',
+    'PyTorchDataLoader',
 ]

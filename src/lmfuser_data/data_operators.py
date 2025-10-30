@@ -1,4 +1,4 @@
-from typing import Iterable, Iterator, Callable
+from typing import Iterable, Iterator, Callable, overload, SupportsIndex
 import logging
 import random
 
@@ -12,7 +12,7 @@ class NotCountableError(Exception):
     ...
 
 
-class Reader:
+class ShardedReader:
     def __init__(
         self, 
         scanner_type: type[Scanner], 
@@ -100,6 +100,29 @@ class Reader:
         return len(self.current_scanner)
 
 
+class CombinedReader:
+    def __init__(self, scanner_type: type[Scanner], path_list: list[str]) -> None:
+        self.scanner_type = scanner_type
+        self.path_list = path_list
+
+        self.rows: list[Row] = []
+        for scanner in [scanner_type(path) for path in path_list]:
+            for row in scanner:
+                self.rows.append(row)
+        
+        self.rows.__getitem__
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    @overload
+    def __getitem__(self, i: SupportsIndex, /) -> Row: ...
+    @overload
+    def __getitem__(self, s: slice, /) -> list[Row]: ...
+    def __getitem__(self, key: slice | SupportsIndex, /) -> Row | list[Row]:
+        return self.rows[key]
+
+
 class RowMapFunctionError(Exception):
     ...
 
@@ -168,7 +191,7 @@ class DataFlow(
 
     def __init__(
         self,
-        reader: Reader,
+        reader: ShardedReader,
         map_fn: Callable[[Row], Row] | None = None,
         flow_fn: Callable[[Iterable[Row]], Iterable[Row]] | None = None,
         ignore_error: bool = False
