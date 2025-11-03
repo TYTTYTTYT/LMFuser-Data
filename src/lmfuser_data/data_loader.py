@@ -273,9 +273,19 @@ class PyTorchDataLoader:
             )
 
         self.dataloader = dataloader
+        self._epoch = 0
+
+    @property
+    def epoch(self) -> int:
+        return self._epoch
 
     def __iter__(self) -> Iterator[Batch]:
-        return self.dataloader.__iter__()
+        def it_wrap() -> Iterator[Batch]:
+            it = iter(self.dataloader)
+            for batch in it:
+                yield batch
+            self._epoch += 1
+        return it_wrap()
 
     def __len__(self) -> int:
         return self.dataloader.__len__()
