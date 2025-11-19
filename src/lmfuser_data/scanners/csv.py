@@ -1,9 +1,9 @@
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from io import BytesIO
-import json
 import requests
-import gzip
 import logging
+
+import pandas as pd
 
 from .interface import Scanner
 from ..interfaces import Row
@@ -12,19 +12,18 @@ from ..utils import retry
 logger = logging.getLogger(__name__)
 
 
-class C4Scanner(Scanner):
+class CSVScanner(Scanner):
     """
-    C4Scanner is a scanner for C4 files.
-    It provides the basic interface for scanning a single file.
+        Scanner for CSV files.
     """
 
     def __init__(self, path: str, **kwargs) -> None:
         super().__init__(path, **kwargs)
-        self._lines: list[str] | None = None
+        self._rows: Sequence[Row] | None = None
 
     @retry(tries=10, delay=0.1, backoff=2, logger=logger)
     def _load_data(self) -> None:
-        if self._lines is not None:
+        if self._rows is not None:
             return
         if self.path.startswith('http'):
             resp = requests.get(self.path)
@@ -34,25 +33,20 @@ class C4Scanner(Scanner):
             with open(self.path, 'rb') as f:
                 content = f.read()
 
-        with gzip.open(BytesIO(content), mode='rt', encoding='utf-8') as f:
-            self._lines = f.readlines()
+        table = pd.read_csv(BytesIO(content))
+
+        self._rows = table.to_dict(orient='records')
 
     def __getitem__(self, index: int) -> Row:
         self._load_data()
-        assert self._lines is not None, 'Data not properly loaded'
+        assert self._rows is not None, 'Data not properly loaded'
 
-        line = self._lines[index]
-        row = json.loads(line)
-        return {
-            'text': str(row['text']),
-            'timestamp': str(row['timestamp']),
-            'url': str(row['url'])
-        }
+        return self._rows[index]
 
     def __len__(self) -> int:
         self._load_data()
-        assert self._lines is not None, 'Data not properly loaded'
-        return len(self._lines)
+        assert self._rows is not None, 'Data not properly loaded'
+        return len(self._rows)
 
     def __iter__(self) -> Iterator[Row]:
         for idx in range(len(self)):
@@ -60,6 +54,6 @@ class C4Scanner(Scanner):
 
     @classmethod
     def check_file(cls, path: str) -> bool:
-        if path.lower().endswith('.json.gz'):
+        if path.lower().endswith('.csv'):
             return True
         return False

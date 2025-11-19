@@ -25,7 +25,7 @@ class ParquetScanner(Scanner):
     def _load_data(self) -> None:
         if self._rows is not None:
             return
-        if self.path.startswith('https'):
+        if self.path.startswith('http'):
             resp = requests.get(self.path)
             resp.raise_for_status()
             content = resp.content
