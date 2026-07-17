@@ -21,13 +21,19 @@ class SubclassTracer:
     @classmethod
     def all_subclasses(cls: type[T]) -> Iterable[type[T]]:
         """
-        Returns an iterable of recursive subclasses.
+        Returns an iterable of recursive subclasses (deduplicated — a class
+        reachable through several bases is yielded once). The previous
+        implementation only walked two levels, so a subclass of a subclass
+        never made it into the registries.
         """
-        def _recursive_subclasses() -> Iterable[type[T]]:
-            for child in cls.__subclasses__():
+        def _recursive_subclasses(c: type, seen: set[type]) -> Iterable[type[T]]:
+            for child in c.__subclasses__():
+                if child in seen:
+                    continue
+                seen.add(child)
                 yield child
-                yield from child.__subclasses__()
-        return _recursive_subclasses()
+                yield from _recursive_subclasses(child, seen)
+        return _recursive_subclasses(cls, set())
 
     @classmethod
     def direct_subclasses(cls: type[T]) -> Iterable[type[T]]:
