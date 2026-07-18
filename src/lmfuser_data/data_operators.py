@@ -100,6 +100,96 @@ class ShardedReader:
         return len(self.current_scanner)
 
 
+class ResumableShardReader:
+    """Infinite shard player with a portable, shard-keyed cursor.
+
+    Designed for ``BatchDataLoader`` resume: unlike ``ShardedReader`` (whose
+    row permutation is seeded by the *slice position* of a shard and therefore
+    tied to one particular consumer), every per-shard row permutation here is
+    seeded by the shard's own identity::
+
+        Random(f'{row_seed}:{epoch}:{shard_url}')
+
+    so the state ``{shard_url: [epoch, next_row]}`` means the same thing for
+    ANY consumer that owns the shard — worker/rank counts can change between
+    save and resume and the cursors still apply after re-slicing.
+
+    Playback order: shards lagging in epoch play first (keeps coverage uniform
+    after a resume hands a consumer a mix of half-played and fresh shards);
+    within the same epoch the order is a per-epoch shuffle seeded by
+    ``order_seed`` (consumer-local, purely cosmetic). A shard resumes from its
+    stored ``next_row`` and, when exhausted, moves to ``[epoch + 1, 0]``.
+    """
+
+    def __init__(
+        self,
+        scanner_type: type[Scanner],
+        shard_urls: list[str],
+        row_seed: int,
+        order_seed: int,
+        shuffle: bool = True,
+        state: dict[str, list[int]] | None = None,
+    ) -> None:
+        assert len(shard_urls) > 0, 'ResumableShardReader needs at least one shard'
+        self.scanner_type = scanner_type
+        self.shard_urls = list(shard_urls)
+        self.row_seed = row_seed
+        self.order_seed = order_seed
+        self.shuffle = shuffle
+        # cursor: url -> [epoch, next_row]; next_row indexes the PERMUTED order
+        self.state: dict[str, list[int]] = {
+            url: list((state or {}).get(url, [0, 0])) for url in self.shard_urls
+        }
+
+    @property
+    def epoch(self) -> int:
+        """Completed epochs = the minimum epoch across owned shards."""
+        return min(e for e, _ in self.state.values())
+
+    def _next_shard(self) -> str:
+        min_epoch = min(e for e, _ in self.state.values())
+        candidates = [u for u in self.shard_urls if self.state[u][0] == min_epoch]
+        if self.shuffle:
+            order = sorted(candidates)
+            random.Random(f'{self.order_seed}:{min_epoch}').shuffle(order)
+        else:
+            order = candidates
+        # prefer a shard already mid-way (there is at most a handful right
+        # after a resume) so partial progress is finished off first
+        for u in order:
+            if self.state[u][1] > 0:
+                return u
+        return order[0]
+
+    def _row_perm(self, url: str, epoch: int, n: int) -> list[int]:
+        idx = list(range(n))
+        if self.shuffle:
+            random.Random(f'{self.row_seed}:{epoch}:{url}').shuffle(idx)
+        return idx
+
+    def __iter__(self) -> Iterator[Row]:
+        while True:
+            url = self._next_shard()
+            epoch, start_row = self.state[url]
+            scanner = self.scanner_type(url)
+            n = len(scanner)
+            perm = self._row_perm(url, epoch, n)
+            for r in range(start_row, n):
+                # advance BEFORE yielding: a generator pauses at yield, so a
+                # post-yield update would miss the last delivered row in any
+                # snapshot taken while paused (off-by-one replay on resume)
+                self.state[url][1] = r + 1
+                yield scanner[perm[r]]
+            self.state[url] = [epoch + 1, 0]
+
+    def is_countable(self) -> bool:
+        return False        # infinite by construction
+
+    def snapshot(self) -> dict[str, list[int]]:
+        """Copy of the cursor table, safe to pickle/share."""
+        return {u: list(v) for u, v in self.state.items()}
+
+
 class CombinedReader:
     def __init__(self, scanner_type: type[Scanner], path_list: list[str]) -> None:
         self.scanner_type = scanner_type
