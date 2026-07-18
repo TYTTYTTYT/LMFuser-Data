@@ -49,7 +49,7 @@ from torch.multiprocessing import Process, Queue
 
 from .interfaces import Batch, Row
 from .scanners import Scanner
-from .data_operators import ShardedReader, DataFlow
+from .data_operators import ResumableShardReader, DataFlow
 from .data_loader import _collate_fn
 from .utils import split_list
 
@@ -82,6 +82,7 @@ def _to_numpy(value: Any) -> np.ndarray | None:
 def _batch_worker_loop(
     worker_id: int,
     source_shards: list[list[str]],       # per source: this worker's shard slice
+    source_states: list[dict[str, list[int]] | None],  # per source: resume cursors
     scanner_type: type[Scanner],
     weights: list[float],
     batch_size: int,
@@ -100,19 +101,28 @@ def _batch_worker_loop(
     shm = shared_memory.SharedMemory(name=shm_name)
     try:
         rng = Random((seed * 1_000_003 + worker_id * 7919) & 0x7FFFFFFF)
-        epochs = [0] * len(source_shards)
+
+        # row permutations are seeded by shard identity (row_seed = the LOADER
+        # seed, identical for every worker) so the cursors reported below stay
+        # valid for any future rank x worker re-slicing; only the play ORDER
+        # of a slice is worker-local
+        readers = [
+            ResumableShardReader(
+                scanner_type, source_shards[i],
+                row_seed=seed,
+                order_seed=seed + 31 * worker_id + i,
+                shuffle=shuffle,
+                state=source_states[i],
+            )
+            for i in range(len(source_shards))
+        ]
 
         def stream(src_idx: int) -> Iterator[Row]:
-            reader = ShardedReader(
-                scanner_type, source_shards[src_idx],
-                seed + 31 * worker_id + src_idx, shuffle, None, True,  # infinite
-            )
-            flow = DataFlow(reader, map_fn, flow_fn, ignore_error)
+            flow = DataFlow(readers[src_idx], map_fn, flow_fn, ignore_error)
             while True:
                 for row in iter(flow):
                     if isinstance(row, Exception):
                         continue  # error sentinel: drop (ignore_error semantics)
-                    epochs[src_idx] = reader.index.epoch
                     yield row
                 # DataFlow exhausted (finite reader edge case): loop forever
                 logger.info(f'[batch-worker {worker_id}] source {src_idx} restarting stream')
@@ -156,7 +166,13 @@ def _batch_worker_loop(
                 _, _, off = specs[key]
                 dst = np.ndarray(arr.shape, dtype=arr.dtype, buffer=shm.buf, offset=base + off)
                 np.copyto(dst, arr)
-            ready_q.put((slot, specs, objects, min(epochs) if epochs else 0))
+            epoch = min(r.epoch for r in readers) if readers else 0
+            # cursor snapshot rides along with every batch (a few KB); the
+            # consumer keeps the latest per worker — saving that reproduces
+            # the stream up to this batch (in-flight reads are skipped, i.e.
+            # a resume loses at most the buffered windows, never repeats)
+            cursors = [r.snapshot() for r in readers]
+            ready_q.put((slot, specs, objects, epoch, worker_id, cursors))
     except Exception:
         logger.exception(f'[batch-worker {worker_id}] fatal error, exiting')
         raise
@@ -191,7 +207,13 @@ class BatchDataLoader:
         num_ranks: int = 1,
         rank_idx: int = 0,
         worker_timeout: float | None = 600.0,
+        resume_state: dict[str, dict[str, list[int]]] | None = None,
     ) -> None:
+        """``resume_state``: the table returned by :meth:`state_dict` (possibly
+        merged across ranks) — ``{source_key: {shard_url: [epoch, next_row]}}``.
+        Cursors are keyed by shard identity, so the saved table remains valid
+        for ANY rank/worker count: shards are re-sliced first, then each worker
+        picks up the cursors of the shards it now owns."""
         if isinstance(scanner_type, str):
             scanner_type = Scanner.get_subclass(scanner_type)
         assert num_workers > 0 and queue_depth > 0 and slot_mb > 0
@@ -202,16 +224,32 @@ class BatchDataLoader:
 
         # ---- partition every source's shards across (ranks x workers) ----
         num_consumers = num_ranks * num_workers
+        self.source_keys = [str(p) for p in path_list]
         per_worker: list[list[list[str]]] = [[] for _ in range(num_workers)]
         for path in path_list:
             lines = _read_shard_lines(path)
             if len(lines) >= num_consumers:
-                parts = split_list(lines, num_consumers)
+                table = (resume_state or {}).get(str(path))
+                if table:
+                    # deal shards in progress order (fresh first) with a
+                    # stride, so every consumer gets a fair mix of fresh and
+                    # already-consumed shards — a contiguous split could hand
+                    # one consumer only exhausted shards, forcing it into the
+                    # next epoch (replays) while others still hold fresh data
+                    order = sorted(
+                        lines,
+                        key=lambda u: (*table.get(u, [0, 0]), u),
+                    )
+                    parts = [order[c::num_consumers] for c in range(num_consumers)]
+                else:
+                    parts = split_list(lines, num_consumers)
                 for w in range(num_workers):
                     per_worker[w].append(parts[rank_idx * num_workers + w])
             else:
                 # fewer shards than consumers: assign round-robin (a shard may
-                # be read by several workers, with different seeds/orders)
+                # be read by several workers, with different seeds/orders; the
+                # duplicate cursors collapse to one entry, so a resume of such
+                # a source is approximate)
                 logger.warning(
                     f'source {path} has {len(lines)} shards < {num_consumers} '
                     f'consumers; assigning shards round-robin (duplicated reads).'
@@ -219,6 +257,21 @@ class BatchDataLoader:
                 for w in range(num_workers):
                     consumer = rank_idx * num_workers + w
                     per_worker[w].append([lines[consumer % len(lines)]])
+
+        # ---- per-worker resume cursors: subset of the table per owned shard ----
+        per_worker_states: list[list[dict[str, list[int]] | None]] = []
+        for w in range(num_workers):
+            states: list[dict[str, list[int]] | None] = []
+            for s, key in enumerate(self.source_keys):
+                table = (resume_state or {}).get(key)
+                if table is None:
+                    states.append(None)
+                else:
+                    states.append({u: table[u] for u in per_worker[w][s] if u in table})
+            per_worker_states.append(states)
+        if resume_state:
+            n_cursors = sum(len(t) for t in resume_state.values())
+            logger.info(f'BatchDataLoader: resuming from {n_cursors} shard cursors')
 
         # ---- shared-memory ring ----
         self.slot_nbytes = slot_mb * 1024 * 1024
@@ -235,11 +288,17 @@ class BatchDataLoader:
         self.batch_size = batch_size
         self._epoch = 0
 
+        # latest cursor snapshot per worker (payload of the last CONSUMED
+        # batch) — the basis of state_dict()
+        self._worker_cursors: dict[int, list[dict[str, list[int]]]] = {}
+        self._initial_states = per_worker_states  # fallback before first batch
+
         self.workers = [
             Process(
                 target=_batch_worker_loop,
                 args=(
-                    w, per_worker[w], scanner_type, weights, batch_size,
+                    w, per_worker[w], per_worker_states[w], scanner_type,
+                    weights, batch_size,
                     seed, shuffle, map_fn, flow_fn, collate_fn, batch_map_fn,
                     ignore_error, self.shm.name, self.slot_nbytes,
                     self.free_q, self.ready_q,
@@ -263,7 +322,8 @@ class BatchDataLoader:
     def __iter__(self) -> Iterator[Batch]:
         while True:
             try:
-                slot, specs, objects, ep = self.ready_q.get(timeout=self.worker_timeout)
+                slot, specs, objects, ep, worker_id, cursors = \
+                    self.ready_q.get(timeout=self.worker_timeout)
             except queue_mod.Empty:
                 if not any(p.is_alive() for p in self.workers):
                     raise RuntimeError('all batch workers died — see worker logs')
@@ -279,7 +339,29 @@ class BatchDataLoader:
             batch.update(objects)
             self.free_q.put(slot)
             self._epoch = max(self._epoch, ep)
+            self._worker_cursors[worker_id] = cursors
             yield batch
+
+    def state_dict(self) -> dict[str, dict[str, list[int]]]:
+        """Merged shard-cursor table for this rank:
+        ``{source_key: {shard_url: [epoch, next_row]}}``.
+
+        Reflects the stream up to the last batch CONSUMED from each worker;
+        rows the workers read ahead (flow buffers, shm ring) are past these
+        cursors, so resuming from the table skips them — bounded loss, no
+        repetition. Merge the per-rank tables (plain dict union — every shard
+        is owned by exactly one consumer) before persisting a global one."""
+        table: dict[str, dict[str, list[int]]] = {k: {} for k in self.source_keys}
+        for w, states in enumerate(self._initial_states):
+            per_source = self._worker_cursors.get(w)
+            if per_source is None:
+                # worker not consumed from yet: fall back to its start state
+                for s, key in enumerate(self.source_keys):
+                    table[key].update(states[s] or {})
+            else:
+                for s, key in enumerate(self.source_keys):
+                    table[key].update(per_source[s])
+        return table
 
     def close(self) -> None:
         for p in getattr(self, 'workers', []):
