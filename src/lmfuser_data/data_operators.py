@@ -144,7 +144,7 @@ class ResumableShardReader:
         # cursor: url -> [epoch, next_row, nrows]; next_row indexes the
         # PERMUTED order, nrows is the row count the cursor was taken against
         # (-1 = unknown, e.g. a 2-element cursor from an older release)
-        self._warned: dict[str, int] = {}   # shard -> epoch last warned about
+        self._problems: dict[str, int] = {}   # shard -> times it has failed
         self.state: dict[str, list[int]] = {}
         for url in self.shard_urls:
             cur = list((state or {}).get(url, [0, 0, -1]))
@@ -215,9 +215,7 @@ class ResumableShardReader:
                 scanner = self.scanner_type(url)
                 n = len(scanner)
             except Exception as e:
-                if self._warned.get(url) != epoch:
-                    self._warned[url] = epoch
-                    logger.warning(f'skipping unreadable shard {url}: {e}')
+                self._note_shard_problem(url, f'unreadable: {e}')
                 self.state[url] = [epoch + 1, 0, known_n]
                 silent_sweeps = self._note_quiet(url, quiet_shards, silent_sweeps, sweeps_needed)
                 continue
@@ -238,7 +236,7 @@ class ResumableShardReader:
                 start_row = 0
 
             if n == 0:
-                logger.warning(f'shard {url} is empty')
+                self._note_shard_problem(url, 'empty')
                 self.state[url] = [epoch + 1, 0, n]
                 silent_sweeps = self._note_quiet(url, quiet_shards, silent_sweeps, sweeps_needed)
                 continue
@@ -279,6 +277,25 @@ class ResumableShardReader:
                 # opened fine, produced nothing: still a quiet shard
                 silent_sweeps = self._note_quiet(url, quiet_shards, silent_sweeps, sweeps_needed)
             self.state[url] = [epoch + 1, 0, n]
+
+    def _note_shard_problem(self, url: str, why: str) -> None:
+        """Log a bad shard on a decaying schedule.
+
+        A failing shard is revisited every sweep, and the failure handler
+        advances its epoch, so throttling on (shard, epoch) never suppressed
+        anything — the pair could not repeat. Count the failures per shard
+        instead and report the 1st, 10th, 100th ... so a persistent problem
+        stays visible without turning into a flood.
+        """
+        n = self._problems.get(url, 0) + 1
+        self._problems[url] = n
+        if n == 1 or (n < 10 ** 9 and n in (10, 100, 1000, 10000)):
+            suffix = '' if n == 1 else f' (x{n})'
+        elif n % 10000 == 0:
+            suffix = f' (x{n})'
+        else:
+            return
+        logger.warning(f'skipping shard {url} — {why}{suffix}')
 
     def _note_quiet(self, url: str, quiet_shards: set, silent_sweeps: int,
                     sweeps_needed: int = 2) -> int:
