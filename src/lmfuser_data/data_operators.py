@@ -12,6 +12,11 @@ logger = logging.getLogger(__name__)
 # staying well under a full sweep for the usual fat slices.
 _MIN_QUIET_VISITS = 8
 
+# How many rows must come out before a shard that failed to open is
+# tried again. It keeps its cursor and therefore the lowest epoch, so
+# without this it would be re-selected on every single visit.
+_RETRY_FAILED_AFTER_ROWS = 1000
+
 
 class NotCountableError(Exception):
     ...
@@ -145,6 +150,7 @@ class ResumableShardReader:
         # PERMUTED order, nrows is the row count the cursor was taken against
         # (-1 = unknown, e.g. a 2-element cursor from an older release)
         self._problems: dict[str, int] = {}   # shard -> times it has failed
+        self._dead: set[str] = set()          # shards currently unreadable
         self.state: dict[str, list[int]] = {}
         for url in self.shard_urls:
             cur = list((state or {}).get(url, [0, 0, -1]))
@@ -154,8 +160,15 @@ class ResumableShardReader:
 
     @property
     def epoch(self) -> int:
-        """Completed epochs = the minimum epoch across owned shards."""
-        return min(v[0] for v in self.state.values())
+        """Completed epochs across the shards that can actually be read.
+
+        A shard that cannot be opened keeps its cursor (it has not been
+        consumed), so it holds the minimum epoch for as long as it stays
+        broken. Counting it would freeze this at 0 forever and an
+        epoch-bounded run would never terminate.
+        """
+        usable = [v[0] for u, v in self.state.items() if u not in self._dead]
+        return min(usable) if usable else min(v[0] for v in self.state.values())
 
     def _next_shard(self, skip: set | None = None) -> str | None:
         pool = [u for u in self.shard_urls if not skip or u not in skip]
@@ -199,7 +212,13 @@ class ResumableShardReader:
         # it catches up. Counting visits made that look like a stuck stream
         # and killed workers that still had thousands of readable rows.
         quiet_shards: set[str] = set()
-        skipped: set[str] = set()
+        # url -> rows yielded when it last failed to open. A dead shard keeps
+        # the lowest epoch (we no longer bump it, so its cursor stays honest),
+        # which makes _next_shard pick it FIRST every time — on a remote source
+        # that is one connection timeout per visit, forever. Retry it on a
+        # budget instead.
+        failed_at: dict[str, int] = {}
+        rows_out = 0
         silent_sweeps = 0
         # A slice can be a single shard (a source with fewer shards than
         # consumers), where two sweeps means two consecutive failed opens —
@@ -207,6 +226,8 @@ class ResumableShardReader:
         # number of quiet visits before declaring the source dead.
         sweeps_needed = max(2, -(-_MIN_QUIET_VISITS // len(self.shard_urls)))
         while True:
+            skipped = {u for u, at in failed_at.items()
+                       if rows_out - at < _RETRY_FAILED_AFTER_ROWS}
             url = self._next_shard(skipped)
             if url is None:
                 # every shard failed to open this sweep. Retry them all rather
@@ -214,7 +235,7 @@ class ResumableShardReader:
                 # has not been consumed, and pretending otherwise both loses
                 # the rest of its epoch and makes its cursor claim more
                 # progress than a sibling that genuinely read most of it.
-                skipped.clear()
+                failed_at.clear()
                 silent_sweeps += 1
                 if silent_sweeps >= sweeps_needed:
                     raise UnusableDataSource(
@@ -238,7 +259,10 @@ class ResumableShardReader:
                 # enough to keep the stream moving, and it resumes exactly
                 # where it was once it comes back.
                 self._note_shard_problem(url, f'unreadable: {e}')
-                skipped.add(url)
+                self._dead.add(url)
+                failed_at[url] = rows_out
+                silent_sweeps = self._note_quiet(url, quiet_shards, silent_sweeps,
+                                                 sweeps_needed, skipped)
                 continue
 
             if known_n >= 0 and known_n != n:
@@ -259,7 +283,8 @@ class ResumableShardReader:
             if n == 0:
                 self._note_shard_problem(url, 'empty')
                 self.state[url] = [epoch + 1, 0, n]
-                silent_sweeps = self._note_quiet(url, quiet_shards, silent_sweeps, sweeps_needed)
+                silent_sweeps = self._note_quiet(url, quiet_shards, silent_sweeps,
+                                                 sweeps_needed, skipped)
                 continue
 
             # A shard whose cursor already sits at its last row is COMPLETE,
@@ -269,6 +294,7 @@ class ResumableShardReader:
             # while paused on a shard's final row records exactly this state.
             # Counting it as "no progress" turned an ordinary resume into a
             # worker-killing RuntimeError.
+            self._dead.discard(url)          # it opened: no longer dead
             perm = self._row_perm(url, epoch, n)
             dropped = 0
             last_error: Exception | None = None
@@ -287,8 +313,8 @@ class ResumableShardReader:
                     last_error = e
                     continue
                 quiet_shards.clear()
-                skipped.clear()      # progress: give the failed shards another go
                 silent_sweeps = 0
+                rows_out += 1
                 yield row
             if dropped:
                 logger.warning(
@@ -297,7 +323,8 @@ class ResumableShardReader:
                 )
             if dropped == n - start_row and n > start_row:
                 # opened fine, produced nothing: still a quiet shard
-                silent_sweeps = self._note_quiet(url, quiet_shards, silent_sweeps, sweeps_needed)
+                silent_sweeps = self._note_quiet(url, quiet_shards, silent_sweeps,
+                                                 sweeps_needed, skipped)
             self.state[url] = [epoch + 1, 0, n]
 
     def _note_shard_problem(self, url: str, why: str) -> None:
@@ -320,7 +347,7 @@ class ResumableShardReader:
         logger.warning(f'skipping shard {url} — {why}{suffix}')
 
     def _note_quiet(self, url: str, quiet_shards: set, silent_sweeps: int,
-                    sweeps_needed: int = 2) -> int:
+                    sweeps_needed: int = 2, skipped: set | None = None) -> int:
         """Record a shard that produced nothing and raise if the stream is
         genuinely stuck.
 
@@ -329,7 +356,12 @@ class ResumableShardReader:
         can produce. Repeat visits to the same lagging shard do not count
         twice — that is the epoch-gap false positive."""
         quiet_shards.add(url)
-        if quiet_shards >= set(self.shard_urls):
+        # A shard held back by the retry throttle is as silent as an empty one.
+        # Counting only `quiet_shards` let a slice with one unreadable and one
+        # empty shard satisfy neither this test nor the all-skipped test — the
+        # two sets are disjoint by construction — and spin at 470k visits/s.
+        seen_quiet = quiet_shards | (skipped or set())
+        if seen_quiet >= set(self.shard_urls):
             quiet_shards.clear()
             silent_sweeps += 1
             if silent_sweeps >= sweeps_needed:

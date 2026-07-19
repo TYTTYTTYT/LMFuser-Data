@@ -352,6 +352,52 @@ def test_tiny_slice_survives_transient_failures() -> None:
     print('PASS 14: a one-shard slice survives transient open failures')
 
 
+def test_unreadable_plus_empty_does_not_spin() -> None:
+    """The two silence counters must share one sweep test.
+
+    Unreadable shards were held in a retry set and empty ones in the quiet
+    set; the sweep test looked at the quiet set alone and the all-skipped test
+    at the retry set alone, so a slice holding one of each satisfied neither —
+    2.36M spin iterations in 5 seconds, one core pinned, no rows, no error.
+    """
+    reset({'U': None, 'E': []})
+    r = ResumableShardReader(MemScanner, ['U', 'E'], row_seed=1, order_seed=1)
+    t0 = time.time()
+    try:
+        next(iter(r))
+    except RuntimeError as e:
+        assert 'unusable' in str(e), e
+        assert time.time() - t0 < 5, 'spun before raising'
+        print('PASS 15: unreadable + empty in one slice raises instead of spinning')
+        return
+    raise AssertionError('mixed unreadable/empty source produced no error')
+
+
+def test_dead_shard_is_not_retried_every_visit() -> None:
+    """A dead shard keeps its cursor, so it holds the lowest epoch and would be
+    re-selected on every visit — one connection timeout per visit on a remote
+    source. It must be retried on a budget, and it must not freeze the reader's
+    epoch (an epoch-bounded run would never terminate)."""
+    opens = {'n': 0}
+
+    class CountingScanner(MemScanner):
+        def __init__(self, path):
+            if path == 'U':
+                opens['n'] += 1
+            super().__init__(path)
+
+    reset({'U': None,
+           **{f'g{i}': [{'i': i * 100 + j} for j in range(20)] for i in range(4)}})
+    r = ResumableShardReader(CountingScanner, ['U'] + [f'g{i}' for i in range(4)],
+                             row_seed=1, order_seed=1)
+    it = iter(r)
+    rows = [next(it) for _ in range(500)]
+    assert len(rows) == 500
+    assert opens['n'] <= 2, f'dead shard retried {opens["n"]}x in 500 rows'
+    assert r.epoch > 0, 'a dead shard froze the epoch counter at 0'
+    print(f'PASS 16: dead shard retried {opens["n"]}x over 500 rows, epoch reached {r.epoch}')
+
+
 if __name__ == '__main__':
     test_unreadable_shard_is_skipped()
     test_all_unreadable_raises()
@@ -367,4 +413,6 @@ if __name__ == '__main__':
     test_no_false_positive_with_wide_epoch_gap()
     test_dead_source_is_reported_promptly()
     test_tiny_slice_survives_transient_failures()
+    test_unreadable_plus_empty_does_not_spin()
+    test_dead_shard_is_not_retried_every_visit()
     print('ALL PASS')
