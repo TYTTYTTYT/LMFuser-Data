@@ -1,4 +1,4 @@
-"""Failure-mode tests for the streaming pipeline (0.3.1).
+"""Failure-mode tests for the streaming pipeline (0.3.2).
 
 Run:  python tests/test_robustness.py
 
@@ -136,10 +136,80 @@ def test_dead_worker_is_surfaced() -> None:
     raise AssertionError('a dead worker went undetected for 200 batches')
 
 
+def test_boundary_cursor_resume() -> None:
+    """A cursor at [epoch, n, n] — a shard consumed to its last row — is the
+    single most common snapshot (the row index advances before the yield, so
+    any snapshot taken while paused on the final row lands there). Resuming
+    from it must roll the shard into its next epoch, NOT be mistaken for a
+    shard that cannot produce."""
+    reset({'s': [{'i': i} for i in range(10)]})
+    r = ResumableShardReader(MemScanner, ['s'], row_seed=2, order_seed=1,
+                             state={'s': [0, 10, 10]})          # boundary cursor
+    it = iter(r)
+    got = [next(it)['i'] for _ in range(10)]
+    assert sorted(got) == list(range(10)), f'epoch 1 not served: {got}'
+    assert r.snapshot()['s'][0] == 1, 'shard did not roll into the next epoch'
+    print('PASS 6: boundary cursor rolls to the next epoch instead of raising')
+
+
+def test_boundary_cursor_resume_through_loader() -> None:
+    """The same thing end to end: save mid-stream (the table will contain
+    boundary cursors), resume, and keep pulling long enough for the liveness
+    check to fire. A worker that raised on a boundary cursor used to die here
+    and take the whole run with it."""
+    import csv
+    import tempfile
+    from lmfuser_data.batch_loader import BatchDataLoader
+
+    tmp = tempfile.mkdtemp(prefix='boundary_')
+    shards = []
+    for s in range(8):
+        p = os.path.join(tmp, f'{s}.csv')
+        with open(p, 'w', newline='') as fh:
+            w = csv.writer(fh)
+            w.writerow(['id'])
+            for i in range(40):
+                w.writerow([s * 40 + i])
+        shards.append(p)
+    src = os.path.join(tmp, 'src.txt')
+    with open(src, 'w') as fh:
+        fh.write('\n'.join(shards))
+
+    common = dict(batch_size=4, path_list=[src], scanner_type='CSVScanner',
+                  seed=7, shuffle=True, num_workers=8, queue_depth=2,
+                  slot_mb=1, worker_timeout=30.0)
+
+    failures = []
+    for consumed in (5, 7, 9, 10, 15):
+        a = BatchDataLoader(**common)
+        it = iter(a)
+        for _ in range(consumed):
+            next(it)
+        state = a.state_dict()
+        a.close()
+
+        boundary = [u for tab in state.values() for u, c in tab.items()
+                    if len(c) > 2 and c[1] == c[2] and c[2] > 0]
+        b = BatchDataLoader(resume_state=state, **common)
+        itb = iter(b)
+        try:
+            for _ in range(120):        # long enough for _check_workers to fire
+                next(itb)
+        except Exception as e:
+            failures.append((consumed, len(boundary), repr(e)[:80]))
+        finally:
+            b.close()
+
+    assert not failures, 'resume died on a boundary cursor: ' + repr(failures)
+    print('PASS 7: cross-process resume survives boundary cursors at 5 save points')
+
+
 if __name__ == '__main__':
     test_unreadable_shard_is_skipped()
     test_all_unreadable_raises()
     test_changed_row_count_replays()
     test_stale_cursor_past_end()
     test_dead_worker_is_surfaced()
+    test_boundary_cursor_resume()
+    test_boundary_cursor_resume_through_loader()
     print('ALL PASS')

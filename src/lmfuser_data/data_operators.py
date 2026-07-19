@@ -196,11 +196,7 @@ class ResumableShardReader:
                 logger.warning(f'skipping unreadable shard {url}: {e}')
                 self.state[url] = [epoch + 1, 0, known_n]
                 barren += 1
-                if barren >= len(self.shard_urls):
-                    raise RuntimeError(
-                        f'no shard produced a row in a full sweep over '
-                        f'{len(self.shard_urls)} shards — data source unusable'
-                    )
+                self._check_progress(barren)
                 continue
 
             if known_n >= 0 and known_n != n:
@@ -218,23 +214,44 @@ class ResumableShardReader:
                 )
                 start_row = 0
 
+            if n == 0:
+                logger.warning(f'shard {url} is empty')
+                self.state[url] = [epoch + 1, 0, n]
+                barren += 1
+                self._check_progress(barren)
+                continue
+
+            # A shard whose cursor already sits at its last row is COMPLETE,
+            # not barren: it yields nothing now and rolls to the next epoch,
+            # where it will serve rows again. Cursors land there routinely —
+            # the row index advances before the yield, so any snapshot taken
+            # while paused on a shard's final row records exactly this state.
+            # Counting it as "no progress" turned an ordinary resume into a
+            # worker-killing RuntimeError.
             perm = self._row_perm(url, epoch, n)
-            produced = False
             for r in range(start_row, n):
-                # advance BEFORE yielding: a generator pauses at yield, so a
-                # post-yield update would miss the last delivered row in any
-                # snapshot taken while paused (off-by-one replay on resume)
                 self.state[url][1] = r + 1
                 self.state[url][2] = n
-                produced = True
-                yield scanner[perm[r]]
+                try:
+                    row = scanner[perm[r]]
+                except Exception as e:
+                    # a shard that opens but fails mid-read (truncated parquet,
+                    # corrupted row group) must not kill the worker either
+                    logger.warning(f'dropping unreadable row {perm[r]} of {url}: {e}')
+                    continue
+                barren = 0
+                yield row
             self.state[url] = [epoch + 1, 0, n]
-            barren = 0 if produced else barren + 1
-            if barren >= len(self.shard_urls):
-                raise RuntimeError(
-                    f'no shard produced a row in a full sweep over '
-                    f'{len(self.shard_urls)} shards — data source unusable'
-                )
+
+    def _check_progress(self, barren: int) -> None:
+        """Guard against spinning: only shards that CANNOT produce (unreadable
+        or empty) count towards this, so a legitimately consumed shard rolling
+        into its next epoch never trips it."""
+        if barren >= len(self.shard_urls):
+            raise RuntimeError(
+                f'none of the {len(self.shard_urls)} shards could produce a row '
+                f'(all unreadable or empty) — data source unusable'
+            )
 
     def is_countable(self) -> bool:
         return False        # infinite by construction
@@ -318,11 +335,12 @@ class FlowIterator(Iterator[Row | RowMapFunctionError | RowFlowFunctionError]):
             self._flow = self._open_flow()
         try:
             return next(self._flow)
-        except StopIteration as e:
-            # a generator that raised is dead; the next call re-opens over the
-            # same (possibly still live) source
-            self._flow = None
-            raise e
+        except StopIteration:
+            # exhaustion is terminal for this iterator: re-opening here would
+            # resurrect a flow that emits on empty input (flush/sentinel
+            # patterns alternate forever). DataFlow.__iter__ mints a new
+            # FlowIterator when the caller genuinely wants another pass.
+            raise
         except RowMapFunctionError as e:
             self._flow = None
             if self.allow_error:

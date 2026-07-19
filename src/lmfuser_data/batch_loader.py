@@ -173,12 +173,16 @@ def _batch_worker_loop(
                 # the stream up to this batch (in-flight reads are skipped, i.e.
                 # a resume loses at most the buffered windows, never repeats)
                 cursors = [r.snapshot() for r in readers]
+                # publish INSIDE the guard: mp.Queue pickles on a feeder
+                # thread, so an unpicklable field in `objects` fails
+                # asynchronously — the slot would be lost while the worker
+                # stayed alive, and the ring would silently drain to a stall
+                ready_q.put((slot, specs, objects, epoch, worker_id, cursors))
             except BaseException:
                 # a slot acquired and never handed on is lost for the process
                 # lifetime; enough of those and every worker blocks on free_q
                 free_q.put(slot)
                 raise
-            ready_q.put((slot, specs, objects, epoch, worker_id, cursors))
     except Exception:
         logger.exception(f'[batch-worker {worker_id}] fatal error, exiting')
         raise
@@ -298,6 +302,7 @@ class BatchDataLoader:
         # waitpid; once per ring-depth of batches is plenty)
         self._check_every = max(num_workers, 1)
         self._since_check = 0
+        self._closed = False
 
         # latest cursor snapshot per worker (payload of the last CONSUMED
         # batch) — the basis of state_dict()
@@ -334,6 +339,8 @@ class BatchDataLoader:
         """A dead worker takes its shard slice with it: the survivors keep the
         queue full, so training continues on a silently shrunken corpus with a
         skewed source mixture. Surface it instead."""
+        if getattr(self, '_closed', False):
+            return          # we sent those SIGTERMs ourselves
         dead = [i for i, p in enumerate(self.workers) if not p.is_alive()]
         if dead:
             raise RuntimeError(
@@ -390,6 +397,7 @@ class BatchDataLoader:
         return table
 
     def close(self) -> None:
+        self._closed = True
         for p in getattr(self, 'workers', []):
             if p.is_alive():
                 p.terminate()
