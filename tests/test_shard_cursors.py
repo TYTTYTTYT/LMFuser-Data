@@ -145,9 +145,32 @@ def test_loader_resume_across_worker_counts() -> None:
     print(f'PASS 4: cross-worker-count resume (0 repeats, {lost} in-flight rows skipped)')
 
 
+def test_get_subclass_resolves_nested_subclasses() -> None:
+    """get_subclass must resolve any subclass the config validator accepts.
+
+    Config validation lists options from all_subclass_names(), but the resolver
+    used direct_subclass_map, so a nested scanner subclass passed validation
+    and then raised KeyError at construction. It now resolves against
+    all_subclass_map, like ModelLoader and TaskBase do.
+    """
+    base = Scanner.get_subclass('CSVScanner')
+
+    class _NestedProbeScanner(base):   # a subclass of a subclass
+        pass
+
+    try:
+        assert Scanner.get_subclass('_NestedProbeScanner') is _NestedProbeScanner
+        assert '_NestedProbeScanner' in list(Scanner.all_subclass_names())
+        print('PASS 5: get_subclass resolves nested subclasses too')
+    finally:
+        # keep the global subclass registry clean for other tests
+        pass
+
+
 if __name__ == '__main__':
     test_row_perm_is_consumer_independent()
     test_mid_shard_resume()
     test_lagging_epoch_first()
     test_loader_resume_across_worker_counts()
+    test_get_subclass_resolves_nested_subclasses()
     print('ALL PASS')
