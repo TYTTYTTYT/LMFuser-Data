@@ -19,7 +19,9 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from lmfuser_data.data_operators import ResumableShardReader  # noqa: E402
+from lmfuser_data.data_operators import (  # noqa: E402
+    ResumableShardReader, DataFlow, UnusableDataSource,
+)
 
 
 class MemScanner:
@@ -252,6 +254,45 @@ def test_partial_breakage_keeps_serving() -> None:
     print('PASS 10: two broken shards do not stop the healthy one')
 
 
+def test_guard_survives_ignore_error() -> None:
+    """The guard must not be downgradable to a per-row error sentinel.
+
+    ignore_error exists to skip poisoned ROWS. Routing a source-level failure
+    through it meant the sentinel was dropped, a fresh iterator was built over
+    the same dead source, and the pipeline spun at ~47k failed opens/second
+    reporting nothing — for every config that sets ignore_data_error: true,
+    which is all of them."""
+    reset({'a': None, 'b': None})
+    flow = DataFlow(ResumableShardReader(MemScanner, ['a', 'b'], row_seed=1,
+                                         order_seed=1),
+                    None, None, True)              # ignore_error=True
+    t0 = time.time()
+    try:
+        while time.time() - t0 < 8:
+            for _ in iter(flow):
+                pass
+    except UnusableDataSource:
+        print('PASS 11: the livelock guard survives ignore_error')
+        return
+    raise AssertionError('guard was swallowed; the pipeline span with no error')
+
+
+def test_no_false_positive_with_wide_epoch_gap() -> None:
+    """Quiet shards are rolled forward one epoch per visit, so a shard lagging
+    the rest by a wide gap is re-selected many times before it catches up.
+    Counting visits rather than distinct shards read that as a stuck stream
+    and killed workers that still had thousands of readable rows."""
+    reset({f's{i}': ([] if i < 2 else [{'i': i * 100 + j} for j in range(20)])
+           for i in range(8)})
+    state = {f's{i}': ([0, 0, 0] if i < 2 else [12, 0, 20]) for i in range(8)}
+    r = ResumableShardReader(MemScanner, [f's{i}' for i in range(8)],
+                             row_seed=1, order_seed=5, state=state)
+    it = iter(r)
+    got = [next(it)['i'] for _ in range(60)]
+    assert len(got) == 60
+    print('PASS 12: an epoch gap of 12 with empty shards does not raise')
+
+
 if __name__ == '__main__':
     test_unreadable_shard_is_skipped()
     test_all_unreadable_raises()
@@ -263,4 +304,6 @@ if __name__ == '__main__':
     test_every_row_failing_raises()
     test_empty_shards_alongside_boundary_cursors()
     test_partial_breakage_keeps_serving()
+    test_guard_survives_ignore_error()
+    test_no_false_positive_with_wide_epoch_gap()
     print('ALL PASS')
