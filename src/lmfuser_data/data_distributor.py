@@ -142,6 +142,16 @@ class DataDistributor:
         current_epoch = self.epoch
         while True:
             if self.last_epoch_row is not None:
+                # The clear MUST stay after the yield; do not reorder or
+                # collapse these two lines.
+                #
+                # A generator pauses AT the yield. `DataLoader.__iter__` sees
+                # the epoch has rolled over and breaks, abandoning this
+                # generator right here — so the line below never runs and the
+                # stashed row survives to be served by the stream the next
+                # epoch builds. Clearing before the yield reads as equivalent
+                # (and is what row_worker.py does in its own loop) but drops
+                # that row for good: one row lost per epoch, silently, forever.
                 yield self.last_epoch_row
                 self.last_epoch_row = None
             for worker_pointer in list(range(self.worker_pointer, len(self.workers))):

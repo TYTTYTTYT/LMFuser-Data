@@ -398,6 +398,81 @@ def test_dead_shard_is_not_retried_every_visit() -> None:
     print(f'PASS 16: dead shard retried {opens["n"]}x over 500 rows, epoch reached {r.epoch}')
 
 
+def test_epoch_boundary_row_is_not_lost() -> None:
+    """No row may be lost or repeated across epoch boundaries.
+
+    The loader drops the row that already belongs to the next epoch, on the
+    understanding that the distributor stashed it and the next epoch's stream
+    re-serves it. That understanding rests on `last_epoch_row` being cleared
+    AFTER its yield in DataDistributor.__iter__: the loader abandons the
+    generator mid-yield, so the clear never runs. Moving the clear before the
+    yield — a refactor that reads as equivalent — loses one row per epoch
+    silently, which is what this test exists to catch.
+    """
+    import csv
+    import tempfile
+    from lmfuser_data.data_loader import DataLoader
+
+    # shapes where the row count divides the batch size, so every epoch emits
+    # a whole number of batches and can be checked exactly
+    for n_shards, rows_each, batch in ((2, 6, 3), (3, 4, 2), (1, 8, 4)):
+        tmp = tempfile.mkdtemp(prefix='epochb_')
+        shards = []
+        for s in range(n_shards):
+            p = os.path.join(tmp, f'{s}.csv')
+            with open(p, 'w', newline='') as fh:
+                w = csv.writer(fh)
+                w.writerow(['id'])
+                for i in range(rows_each):
+                    w.writerow([s * 1000 + i])
+            shards.append(p)
+        src = os.path.join(tmp, 'src.txt')
+        with open(src, 'w') as fh:
+            fh.write('\n'.join(shards))
+
+        dl = DataLoader(batch_size=batch, path_list=[src], scanner_type='CSVScanner',
+                        seed=1, shuffle=False, pre_fetch_factor=0,
+                        instruct_timeout=30, worker_timeout=30)
+        total = n_shards * rows_each
+        for ep in range(4):
+            rows = [int(x) for b in dl for x in b['id']]
+            assert len(rows) == len(set(rows)), (
+                f'{n_shards}x{rows_each}/b{batch} epoch{ep}: duplicated rows')
+            assert len(rows) == total, (
+                f'{n_shards}x{rows_each}/b{batch} epoch{ep}: {len(rows)} rows, '
+                f'expected {total} — a row was lost at the boundary')
+    # and a shape that does NOT divide: the trailing partial batch is carried
+    # into the next epoch by design, so check the multiset across epochs
+    tmp = tempfile.mkdtemp(prefix='epochb_odd_')
+    shards = []
+    for s in range(3):
+        p = os.path.join(tmp, f'{s}.csv')
+        with open(p, 'w', newline='') as fh:
+            w = csv.writer(fh)
+            w.writerow(['id'])
+            for i in range(5):
+                w.writerow([s * 1000 + i])
+        shards.append(p)
+    src = os.path.join(tmp, 'src.txt')
+    with open(src, 'w') as fh:
+        fh.write('\n'.join(shards))
+    dl = DataLoader(batch_size=2, path_list=[src], scanner_type='CSVScanner',
+                    seed=1, shuffle=False, pre_fetch_factor=0,
+                    instruct_timeout=30, worker_timeout=30)
+    from collections import Counter
+    seen: Counter = Counter()
+    epochs = 4
+    for _ in range(epochs):
+        seen.update(int(x) for b in dl for x in b['id'])
+    assert len(seen) == 15, f'only {len(seen)} distinct rows ever appeared'
+    for row_id, count in seen.items():
+        assert epochs - 1 <= count <= epochs, (
+            f'row {row_id} seen {count}x over {epochs} epochs — expected '
+            f'{epochs} (or {epochs - 1} with one still buffered)')
+    print('PASS 17: epoch boundaries lose and duplicate nothing '
+          '(3 exact shapes x 4 epochs, plus a non-dividing shape by multiset)')
+
+
 if __name__ == '__main__':
     test_unreadable_shard_is_skipped()
     test_all_unreadable_raises()
@@ -415,4 +490,5 @@ if __name__ == '__main__':
     test_tiny_slice_survives_transient_failures()
     test_unreadable_plus_empty_does_not_spin()
     test_dead_shard_is_not_retried_every_visit()
+    test_epoch_boundary_row_is_not_lost()
     print('ALL PASS')
