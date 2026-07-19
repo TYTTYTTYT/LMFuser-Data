@@ -24,6 +24,16 @@ logger = logging.getLogger(__name__)
 _QUEUE_TIMEOUTS = (queue_mod.Empty, queue_mod.Full, TimeoutError)
 
 
+class WorkerTimeout(TimeoutError):
+    """A worker did not answer in time.
+
+    Raised instead of letting a bare `queue.Empty` — whose str() is the empty
+    string — escape to the training loop. The most common cause is a source
+    that cannot produce anything (an empty or missing shard), which otherwise
+    surfaces as an exception with no message at all.
+    """
+
+
 class WorkerInstruct:
     ...
 
@@ -242,8 +252,10 @@ class RowWorker:
             assert isinstance(worker_info, WorkerInfo)
             self.worker_info = worker_info
         except _QUEUE_TIMEOUTS as e:
-            logger.error(f"Worker timed out waiting for worker info: {e}")
-            raise e
+            raise WorkerTimeout(
+                f'worker for {self.path_list[:2]}{"..." if len(self.path_list) > 2 else ""} '
+                f'did not report back within {self.worker_timeout}s of starting'
+            ) from e
 
     def check_alive(self) -> bool:
         return self.worker.is_alive()
@@ -257,8 +269,10 @@ class RowWorker:
         try:
             self.instruct_queue.put(Seek(index.epoch, index.part, index.row), timeout=self.worker_timeout)
         except _QUEUE_TIMEOUTS as e:
-            logger.error(f"Worker timed out waiting for seek instruction: {index}")
-            raise e
+            raise WorkerTimeout(
+                f'worker did not accept a seek to {index} within '
+                f'{self.worker_timeout}s'
+            ) from e
         self.queue_size += 1
 
         item = None
@@ -268,8 +282,10 @@ class RowWorker:
                 index = self.index_queue.get(timeout=self.worker_timeout)
                 self.queue_size -= 1
             except _QUEUE_TIMEOUTS as e:
-                logger.error(f"Worker timed out waiting for index: {index}")
-                raise e
+                raise WorkerTimeout(
+                    f'worker produced no row within {self.worker_timeout}s '
+                    f'while seeking {index} — is this source empty?'
+                ) from e
 
         self.index = index
 
@@ -327,8 +343,11 @@ class RowWorker:
                 index = self.index_queue.get(timeout=self.worker_timeout)
                 self.queue_size -= 1
             except _QUEUE_TIMEOUTS as e:
-                logger.error(f"Worker timed out waiting for the next iteration.")
-                raise e
+                raise WorkerTimeout(
+                    f'no row within {self.worker_timeout}s from the worker for '
+                    f'{self.path_list[:2]}{"..." if len(self.path_list) > 2 else ""} '
+                    f'— an empty or unreadable source looks exactly like this'
+                ) from e
 
             assert isinstance(index, Index)
             if index.epoch == cur_epoch:
