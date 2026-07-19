@@ -204,6 +204,54 @@ def test_boundary_cursor_resume_through_loader() -> None:
     print('PASS 7: cross-process resume survives boundary cursors at 5 save points')
 
 
+def test_every_row_failing_raises() -> None:
+    """A shard that OPENS fine but whose every row fails must not spin. The
+    per-row guard introduced to stop such a shard killing the worker created
+    exactly that: 245k failed reads in 2s, no rows, no error, a warning per
+    attempt."""
+    class RowFailScanner(MemScanner):
+        def __getitem__(self, i):
+            raise OSError('bad row')
+
+    reset({'x': [{'i': i} for i in range(10)], 'y': [{'i': i} for i in range(10)]})
+    r = ResumableShardReader(RowFailScanner, ['x', 'y'], row_seed=1, order_seed=1)
+    t0 = time.time()
+    try:
+        next(iter(r))
+    except RuntimeError as e:
+        assert 'unusable' in str(e), e
+        assert time.time() - t0 < 5, 'spun before raising'
+        print('PASS 8: a shard whose every row fails raises instead of spinning')
+        return
+    raise AssertionError('all-rows-failing produced no error')
+
+
+def test_empty_shards_alongside_boundary_cursors() -> None:
+    """Empty shards must not accumulate towards the livelock guard while
+    healthy shards sit at their boundary cursors — that combination killed
+    both workers on the first resume."""
+    reset({'a': [], 'b': [],
+           'c': [{'i': i} for i in range(5)], 'd': [{'i': i} for i in range(5)]})
+    r = ResumableShardReader(
+        MemScanner, ['a', 'b', 'c', 'd'], row_seed=1, order_seed=3,
+        state={'a': [0, 0, 0], 'b': [0, 0, 0], 'c': [0, 5, 5], 'd': [0, 5, 5]},
+    )
+    it = iter(r)
+    got = [next(it)['i'] for _ in range(10)]
+    assert len(got) == 10, got
+    print('PASS 9: empty shards + boundary cursors keep serving')
+
+
+def test_partial_breakage_keeps_serving() -> None:
+    """Broken shards must never accumulate to a raise while any shard works."""
+    reset({'p': None, 'q': None, 'g': [{'i': i} for i in range(4)]})
+    r = ResumableShardReader(MemScanner, ['p', 'q', 'g'], row_seed=1, order_seed=1)
+    it = iter(r)
+    got = [next(it)['i'] for _ in range(12)]
+    assert len(got) == 12
+    print('PASS 10: two broken shards do not stop the healthy one')
+
+
 if __name__ == '__main__':
     test_unreadable_shard_is_skipped()
     test_all_unreadable_raises()
@@ -212,4 +260,7 @@ if __name__ == '__main__':
     test_dead_worker_is_surfaced()
     test_boundary_cursor_resume()
     test_boundary_cursor_resume_through_loader()
+    test_every_row_failing_raises()
+    test_empty_shards_alongside_boundary_cursors()
+    test_partial_breakage_keeps_serving()
     print('ALL PASS')

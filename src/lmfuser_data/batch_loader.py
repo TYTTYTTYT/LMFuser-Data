@@ -41,6 +41,7 @@ import multiprocessing as mp
 import os
 import logging
 import queue as queue_mod
+import pickle
 
 import numpy as np
 import torch
@@ -173,10 +174,24 @@ def _batch_worker_loop(
                 # the stream up to this batch (in-flight reads are skipped, i.e.
                 # a resume loses at most the buffered windows, never repeats)
                 cursors = [r.snapshot() for r in readers]
-                # publish INSIDE the guard: mp.Queue pickles on a feeder
-                # thread, so an unpicklable field in `objects` fails
-                # asynchronously — the slot would be lost while the worker
-                # stayed alive, and the ring would silently drain to a stall
+                # mp.Queue pickles on a background feeder thread, so an
+                # unpicklable payload raises THERE: put() returns normally,
+                # nothing is delivered, and the slot is lost while the worker
+                # stays alive — the ring drains until every worker blocks and
+                # the consumer reports a timeout with "N workers alive".
+                # Moving the call inside this try does not help; the payload
+                # has to be checked before it is handed over. Only `objects`
+                # can hold arbitrary values (tensors travel through shm), and
+                # it is small, so the probe is cheap.
+                if objects:
+                    try:
+                        pickle.dumps(objects)
+                    except Exception as e:
+                        raise RuntimeError(
+                            f'batch field(s) {sorted(objects)} cannot be sent to '
+                            f'the consumer: {e}. Return tensors or plain '
+                            f'picklable values from collate_fn.'
+                        ) from e
                 ready_q.put((slot, specs, objects, epoch, worker_id, cursors))
             except BaseException:
                 # a slot acquired and never handed on is lost for the process
