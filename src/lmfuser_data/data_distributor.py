@@ -14,7 +14,7 @@ _HTTP_TIMEOUT = (10, 120)
 from .row_worker import RowWorker
 from .interfaces import Row, Index
 from .scanners import Scanner
-from .utils import split_list
+from .utils import split_list, slowest_epoch
 
 logger = logging.getLogger(__name__)
 
@@ -134,8 +134,12 @@ class DataDistributor:
 
     @property
     def epoch(self) -> int:
-        epoches = [worker.index.epoch for worker in self.workers]
-        return max(epoches)
+        """Completed epochs = the SLOWEST worker's. See `slowest_epoch`.
+
+        Workers are drawn round-robin, so all of them progress; there are no
+        weights to exclude here.
+        """
+        return slowest_epoch([worker.index.epoch for worker in self.workers])
 
     def __iter__(self) -> Iterator[Row]:
         iters = [iter(worker) for worker in self.workers]

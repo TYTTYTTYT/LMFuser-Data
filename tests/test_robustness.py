@@ -523,6 +523,87 @@ def test_multi_source_epoch_covers_every_source() -> None:
           f'min exposure {min(big_seen.values())} over 3 epochs')
 
 
+def test_epoch_covers_every_worker_within_a_source() -> None:
+    """The same defect one axis down: shards within ONE source.
+
+    Fixing the source axis alone left this untouched — a 3-row shard and a
+    12-row shard behind num_workers=2 delivered the small shard 3x and only
+    9/12 of the large one, which is the source-axis bug reproduced verbatim
+    one level below it. num_workers > 1 is the common case, so this axis was
+    the more live of the two.
+    """
+    import tempfile
+    import csv
+    from collections import Counter
+    from lmfuser_data.data_loader import DataLoader
+    tmp = tempfile.mkdtemp()
+    shards = []
+    for name, n_rows in (('S', 3), ('L', 12)):
+        p = os.path.join(tmp, f'{name}.csv')
+        with open(p, 'w', newline='') as fh:
+            w = csv.writer(fh)
+            w.writerow(['id'])
+            for i in range(n_rows):
+                w.writerow([f'{name}-{i}'])
+        shards.append(p)
+    sp = os.path.join(tmp, 'src.txt')
+    with open(sp, 'w') as fh:
+        fh.write('\n'.join(shards))
+
+    dl = DataLoader(batch_size=1, path_list=[sp], scanner_type='CSVScanner',
+                    seed=1, shuffle=False, pre_fetch_factor=0, num_workers=2,
+                    instruct_timeout=30, worker_timeout=30)
+    seen = Counter()
+    for _ in range(3):
+        seen.update(x for b in dl for x in b['id'])
+    big = {f'L-{i}' for i in range(12)}
+    covered = len(big & set(seen))
+    assert covered == 12, (
+        f'large shard covered {covered}/12 over three epochs — the small '
+        f'shard is still closing the epoch for the whole source')
+    print(f'PASS 19: every worker covered within a source ({covered}/12)')
+
+
+def test_zero_weight_source_does_not_stall_the_epoch() -> None:
+    """A weight of 0.0 must not make the epoch unreachable.
+
+    Taking the minimum over sources is right, but a source with weight 0.0 is
+    never drawn, so its epoch stays at 0 and the minimum never advances: the
+    epoch never ends and `stop_by: epoch` never stops. FloatArg(min_value=0.0)
+    makes 0.0 a legal config value, so this is reachable from a YAML.
+    """
+    import tempfile
+    import csv
+    from collections import Counter
+    from lmfuser_data.data_loader import DataLoader
+    tmp = tempfile.mkdtemp()
+    srcs = []
+    for name in ('A', 'B'):
+        p = os.path.join(tmp, f'{name}.csv')
+        with open(p, 'w', newline='') as fh:
+            w = csv.writer(fh)
+            w.writerow(['id'])
+            for i in range(4):
+                w.writerow([f'{name}{i}'])
+        sp = os.path.join(tmp, f'{name}.txt')
+        with open(sp, 'w') as fh:
+            fh.write(p)
+        srcs.append(sp)
+
+    dl = DataLoader(batch_size=1, path_list=srcs, scanner_type='CSVScanner',
+                    seed=1, shuffle=False, pre_fetch_factor=0,
+                    distributor_weights=[1.0, 0.0],
+                    instruct_timeout=30, worker_timeout=30)
+    rows = []
+    for b in dl:
+        rows.extend(b['id'])
+        assert len(rows) <= 40, 'epoch never ended with a zero-weight source'
+    assert all(x.startswith('A') for x in rows), \
+        f'the zero-weight source was drawn from: {rows}'
+    print(f'PASS 20: zero-weight source does not stall the epoch '
+          f'({len(rows)} rows, terminated)')
+
+
 if __name__ == '__main__':
     test_unreadable_shard_is_skipped()
     test_all_unreadable_raises()
@@ -542,4 +623,6 @@ if __name__ == '__main__':
     test_dead_shard_is_not_retried_every_visit()
     test_epoch_boundary_row_is_not_lost()
     test_multi_source_epoch_covers_every_source()
+    test_epoch_covers_every_worker_within_a_source()
+    test_zero_weight_source_does_not_stall_the_epoch()
     print('ALL PASS')

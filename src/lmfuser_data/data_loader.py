@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader as Loader
 
 from .data_distributor import DataDistributor
 from .interfaces import Batch, Row, Index
-from .utils import mix_iterables
+from .utils import mix_iterables, slowest_epoch
 from .scanners import Scanner
 from .data_operators import CombinedReader
 
@@ -146,17 +146,15 @@ class DataLoader:
 
     @property
     def epoch(self) -> int:
-        """Completed epochs = the SLOWEST source's, not the fastest's.
+        """Completed epochs = the SLOWEST source's. See `slowest_epoch`.
 
-        `max` closed the epoch as soon as ANY one source had been round once,
-        so with sources of different sizes the smallest ended the epoch for
-        everybody and the largest was never covered: 18 rows across two
-        sources delivered 10, 12, 6 and 12 rows over four epochs, some rows
-        seen four times and others once. `min` means an epoch is over when
-        every source has been round at least once; small sources repeat
-        within it, which is what the mixing weights already imply.
+        Sources carry mixing weights and a weight of 0.0 means the source is
+        never drawn, so it is excluded rather than stalling the epoch forever.
         """
-        return min([distributor.epoch for distributor in self.distributors])
+        return slowest_epoch(
+            [distributor.epoch for distributor in self.distributors],
+            self.distributor_weights,
+        )
 
     def __iter__(self) -> Iterator[Batch]:
         current_epoch = self.epoch
@@ -197,7 +195,11 @@ class DataLoader:
     def states(self) -> bytes:
         return pickle.dumps({
             'batch_size': self.batch_size,
-            'path_list': self.distributors[0].path,
+            # One path PER distributor. This stored distributors[0].path — a
+            # single string — which __init__ then zipped against `indexes`,
+            # iterating it character by character: the resumed distributor's
+            # path came out as '/' and resume died with IsADirectoryError.
+            'path_list': [distributor.path for distributor in self.distributors],
             'scanner_type': self.distributors[0].scanner_type,
             'seed': self.seed,
             'shuffle': self.distributors[0].shuffle,
