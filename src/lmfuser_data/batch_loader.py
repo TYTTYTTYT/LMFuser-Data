@@ -46,6 +46,12 @@ import pickle
 import numpy as np
 import torch
 import requests
+
+# (connect, read) seconds. Without a timeout a stalled HTTP fetch — no RST,
+# no data — hangs the worker forever: @retry never engages because nothing
+# raises, and the livelock guard never runs because the iterator never
+# returns. The read budget is per socket read, so large shards are fine.
+_HTTP_TIMEOUT = (10, 120)
 from torch.multiprocessing import Process, Queue
 
 from .interfaces import Batch, Row
@@ -63,7 +69,7 @@ def _read_shard_lines(path: str | os.PathLike) -> list[str]:
     """One line per shard, from a local file or an https:// url (same contract
     as ``DataDistributor.init_path_lists``)."""
     if str(path).startswith('https://'):
-        resp = requests.get(str(path))
+        resp = requests.get(str(path), timeout=_HTTP_TIMEOUT)
         resp.raise_for_status()
         lines = resp.content.decode('utf-8').splitlines()
     else:
@@ -366,15 +372,29 @@ class BatchDataLoader:
 
     def __iter__(self) -> Iterator[Batch]:
         while True:
-            try:
-                slot, specs, objects, ep, worker_id, cursors = \
-                    self.ready_q.get(timeout=self.worker_timeout)
-            except queue_mod.Empty:
+            # Poll in slices rather than one long blocking wait: dead workers
+            # are only noticed on the happy path or on a timeout, so with the
+            # generous worker_timeout a streaming source needs (an hour, in
+            # the pretrain configs) a source that dies takes that long to be
+            # reported — as a timeout, which points at the wrong thing.
+            deadline = self.worker_timeout
+            got = None
+            while deadline is None or deadline > 0:
+                slice_s = 15.0 if deadline is None else min(15.0, deadline)
+                try:
+                    got = self.ready_q.get(timeout=slice_s)
+                    break
+                except queue_mod.Empty:
+                    self._check_workers()       # raises if any worker died
+                    if deadline is not None:
+                        deadline -= slice_s
+            if got is None:
                 self._check_workers()
                 raise TimeoutError(
                     f'no batch arrived within {self.worker_timeout}s '
                     f'({sum(p.is_alive() for p in self.workers)} workers alive)'
                 )
+            slot, specs, objects, ep, worker_id, cursors = got
             base = slot * self.slot_nbytes
             batch: Batch = {}
             for key, (dtype, shape, off) in specs.items():

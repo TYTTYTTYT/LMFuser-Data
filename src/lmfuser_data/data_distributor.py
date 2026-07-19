@@ -5,6 +5,12 @@ import logging
 
 import requests
 
+# (connect, read) seconds. Without a timeout a stalled HTTP fetch — no RST,
+# no data — hangs the worker forever: @retry never engages because nothing
+# raises, and the livelock guard never runs because the iterator never
+# returns. The read budget is per socket read, so large shards are fine.
+_HTTP_TIMEOUT = (10, 120)
+
 from .row_worker import RowWorker
 from .interfaces import Row, Index
 from .scanners import Scanner
@@ -65,7 +71,7 @@ class DataDistributor:
 
     def init_path_lists(self) -> None:
         if str(self.path).startswith('https://'):
-            resp = requests.get(str(self.path))
+            resp = requests.get(str(self.path), timeout=_HTTP_TIMEOUT)
             resp.raise_for_status()
             content = resp.content
             assert isinstance(content, bytes)

@@ -293,6 +293,65 @@ def test_no_false_positive_with_wide_epoch_gap() -> None:
     print('PASS 12: an epoch gap of 12 with empty shards does not raise')
 
 
+def test_dead_source_is_reported_promptly() -> None:
+    """A dead source must not hide behind worker_timeout. The consumer only
+    checked liveness on the happy path or after the full timeout, so with the
+    production worker_timeout of 3600s a source that died at startup looked
+    like an hour-long hang and then reported a timeout — pointing at the
+    wrong thing entirely."""
+    import csv
+    import tempfile
+    from lmfuser_data.batch_loader import BatchDataLoader
+
+    tmp = tempfile.mkdtemp(prefix='deadsrc_')
+    shards = []
+    for s in range(2):
+        p = os.path.join(tmp, f'{s}.csv')
+        with open(p, 'w', newline='') as fh:
+            csv.writer(fh).writerow(['id'])          # header only: no rows
+        shards.append(p)
+    src = os.path.join(tmp, 'src.txt')
+    with open(src, 'w') as fh:
+        fh.write('\n'.join(shards))
+
+    dl = BatchDataLoader(batch_size=2, path_list=[src], scanner_type='CSVScanner',
+                         seed=1, shuffle=True, num_workers=2, queue_depth=2,
+                         slot_mb=1, worker_timeout=3600.0)
+    t0 = time.time()
+    try:
+        next(iter(dl))
+    except RuntimeError as e:
+        took = time.time() - t0
+        assert 'died' in str(e), e
+        assert took < 120, f'took {took:.0f}s with worker_timeout=3600'
+        print(f'PASS 13: dead source reported in {took:.0f}s despite worker_timeout=3600')
+        return
+    finally:
+        dl.close()
+    raise AssertionError('a dead source produced no error')
+
+
+def test_tiny_slice_survives_transient_failures() -> None:
+    """A source with fewer shards than consumers gives each worker a single
+    shard, where two sweeps means two failed opens — a brief blip would kill
+    the run."""
+    calls = {'n': 0}
+
+    class FlakyScanner(MemScanner):
+        def __init__(self, path):
+            calls['n'] += 1
+            if calls['n'] <= 3:                      # three transient failures
+                raise OSError('transient')
+            super().__init__(path)
+
+    reset({'only': [{'i': i} for i in range(5)]})
+    r = ResumableShardReader(FlakyScanner, ['only'], row_seed=1, order_seed=1)
+    it = iter(r)
+    got = [next(it)['i'] for _ in range(5)]
+    assert sorted(got) == list(range(5)), got
+    print('PASS 14: a one-shard slice survives transient open failures')
+
+
 if __name__ == '__main__':
     test_unreadable_shard_is_skipped()
     test_all_unreadable_raises()
@@ -306,4 +365,6 @@ if __name__ == '__main__':
     test_partial_breakage_keeps_serving()
     test_guard_survives_ignore_error()
     test_no_false_positive_with_wide_epoch_gap()
+    test_dead_source_is_reported_promptly()
+    test_tiny_slice_survives_transient_failures()
     print('ALL PASS')
