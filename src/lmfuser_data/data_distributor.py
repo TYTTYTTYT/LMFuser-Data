@@ -5,10 +5,16 @@ import logging
 
 import requests
 
+# (connect, read) seconds. Without a timeout a stalled HTTP fetch — no RST,
+# no data — hangs the worker forever: @retry never engages because nothing
+# raises, and the livelock guard never runs because the iterator never
+# returns. The read budget is per socket read, so large shards are fine.
+_HTTP_TIMEOUT = (10, 120)
+
 from .row_worker import RowWorker
 from .interfaces import Row, Index
 from .scanners import Scanner
-from .utils import split_list
+from .utils import split_list, slowest_epoch
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +71,7 @@ class DataDistributor:
 
     def init_path_lists(self) -> None:
         if str(self.path).startswith('https://'):
-            resp = requests.get(str(self.path))
+            resp = requests.get(str(self.path), timeout=_HTTP_TIMEOUT)
             resp.raise_for_status()
             content = resp.content
             assert isinstance(content, bytes)
@@ -128,14 +134,28 @@ class DataDistributor:
 
     @property
     def epoch(self) -> int:
-        epoches = [worker.index.epoch for worker in self.workers]
-        return max(epoches)
+        """Completed epochs = the SLOWEST worker's. See `slowest_epoch`.
+
+        Workers are drawn round-robin, so all of them progress; there are no
+        weights to exclude here.
+        """
+        return slowest_epoch([worker.index.epoch for worker in self.workers])
 
     def __iter__(self) -> Iterator[Row]:
         iters = [iter(worker) for worker in self.workers]
         current_epoch = self.epoch
         while True:
             if self.last_epoch_row is not None:
+                # The clear MUST stay after the yield; do not reorder or
+                # collapse these two lines.
+                #
+                # A generator pauses AT the yield. `DataLoader.__iter__` sees
+                # the epoch has rolled over and breaks, abandoning this
+                # generator right here — so the line below never runs and the
+                # stashed row survives to be served by the stream the next
+                # epoch builds. Clearing before the yield reads as equivalent
+                # (and is what row_worker.py does in its own loop) but drops
+                # that row for good: one row lost per epoch, silently, forever.
                 yield self.last_epoch_row
                 self.last_epoch_row = None
             for worker_pointer in list(range(self.worker_pointer, len(self.workers))):

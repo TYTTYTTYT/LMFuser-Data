@@ -1,6 +1,12 @@
 from collections.abc import Iterator
 from io import BytesIO
 import requests
+
+# (connect, read) seconds. Without a timeout a stalled HTTP fetch — no RST,
+# no data — hangs the worker forever: @retry never engages because nothing
+# raises, and the livelock guard never runs because the iterator never
+# returns. The read budget is per socket read, so large shards are fine.
+_HTTP_TIMEOUT = (10, 120)
 import logging
 
 from pyarrow.ipc import RecordBatchStreamReader
@@ -26,7 +32,7 @@ class ArrowScanner(Scanner):
         if self._rows is not None:
             return
         if self.path.startswith('http'):
-            resp = requests.get(self.path)
+            resp = requests.get(self.path, timeout=_HTTP_TIMEOUT)
             resp.raise_for_status()
             content = resp.content
         else:

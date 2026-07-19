@@ -7,6 +7,16 @@ from .interfaces import Row, Index, SubclassTracer
 
 logger = logging.getLogger(__name__)
 
+# Minimum number of quiet shard visits before a source is declared dead.
+# Keeps a one-shard slice from dying on two transient failures while
+# staying well under a full sweep for the usual fat slices.
+_MIN_QUIET_VISITS = 8
+
+# How many rows must come out before a shard that failed to open is
+# tried again. It keeps its cursor and therefore the lowest epoch, so
+# without this it would be re-selected on every single visit.
+_RETRY_FAILED_AFTER_ROWS = 1000
+
 
 class NotCountableError(Exception):
     ...
@@ -139,6 +149,8 @@ class ResumableShardReader:
         # cursor: url -> [epoch, next_row, nrows]; next_row indexes the
         # PERMUTED order, nrows is the row count the cursor was taken against
         # (-1 = unknown, e.g. a 2-element cursor from an older release)
+        self._problems: dict[str, int] = {}   # shard -> times it has failed
+        self._dead: set[str] = set()          # shards currently unreadable
         self.state: dict[str, list[int]] = {}
         for url in self.shard_urls:
             cur = list((state or {}).get(url, [0, 0, -1]))
@@ -148,12 +160,22 @@ class ResumableShardReader:
 
     @property
     def epoch(self) -> int:
-        """Completed epochs = the minimum epoch across owned shards."""
-        return min(v[0] for v in self.state.values())
+        """Completed epochs across the shards that can actually be read.
 
-    def _next_shard(self) -> str:
-        min_epoch = min(v[0] for v in self.state.values())
-        candidates = [u for u in self.shard_urls if self.state[u][0] == min_epoch]
+        A shard that cannot be opened keeps its cursor (it has not been
+        consumed), so it holds the minimum epoch for as long as it stays
+        broken. Counting it would freeze this at 0 forever and an
+        epoch-bounded run would never terminate.
+        """
+        usable = [v[0] for u, v in self.state.items() if u not in self._dead]
+        return min(usable) if usable else min(v[0] for v in self.state.values())
+
+    def _next_shard(self, skip: set | None = None) -> str | None:
+        pool = [u for u in self.shard_urls if not skip or u not in skip]
+        if not pool:
+            return None                      # everything is being skipped
+        min_epoch = min(self.state[u][0] for u in pool)
+        candidates = [u for u in pool if self.state[u][0] == min_epoch]
         if self.shuffle:
             order = sorted(candidates)
             random.Random(f'{self.order_seed}:{min_epoch}').shuffle(order)
@@ -173,15 +195,54 @@ class ResumableShardReader:
         return idx
 
     def __iter__(self) -> Iterator[Row]:
-        # A shard that yields nothing (unreadable, empty, or fully consumed by
-        # a stale cursor) must not be able to stall the stream: _next_shard()
-        # is a pure function of the cursor table, so re-selecting the same
-        # failing shard forever is otherwise a livelock at zero throughput.
-        # Every shard is retired to the next epoch on the way out, and a full
-        # sweep with no rows at all is a hard error rather than a spin.
-        barren = 0
+        # Livelock guard. `_next_shard()` is a pure function of the cursor
+        # table, so anything that yields nothing while leaving the table
+        # unchanged would spin forever at zero throughput.
+        #
+        # The signal is "how many full sweeps have gone by with no row", not
+        # any classification of why a shard was quiet — earlier attempts to
+        # classify got it wrong in both directions. A shard sitting at its
+        # boundary cursor legitimately yields nothing on the sweep right after
+        # a resume, then serves its next epoch; so one silent sweep is normal
+        # and TWO is not.
+        #
+        # A sweep is counted by DISTINCT shards seen, not by visits: quiet
+        # shards are rolled forward one epoch at a time, so a shard lagging
+        # the others by a wide epoch gap gets re-selected on every visit until
+        # it catches up. Counting visits made that look like a stuck stream
+        # and killed workers that still had thousands of readable rows.
+        quiet_shards: set[str] = set()
+        # url -> rows yielded when it last failed to open. A dead shard keeps
+        # the lowest epoch (we no longer bump it, so its cursor stays honest),
+        # which makes _next_shard pick it FIRST every time — on a remote source
+        # that is one connection timeout per visit, forever. Retry it on a
+        # budget instead.
+        failed_at: dict[str, int] = {}
+        rows_out = 0
+        silent_sweeps = 0
+        # A slice can be a single shard (a source with fewer shards than
+        # consumers), where two sweeps means two consecutive failed opens —
+        # a brief network blip would kill the run. Require a floor on the
+        # number of quiet visits before declaring the source dead.
+        sweeps_needed = max(2, -(-_MIN_QUIET_VISITS // len(self.shard_urls)))
         while True:
-            url = self._next_shard()
+            skipped = {u for u, at in failed_at.items()
+                       if rows_out - at < _RETRY_FAILED_AFTER_ROWS}
+            url = self._next_shard(skipped)
+            if url is None:
+                # every shard failed to open this sweep. Retry them all rather
+                # than advancing anyone's epoch: a shard that could not be READ
+                # has not been consumed, and pretending otherwise both loses
+                # the rest of its epoch and makes its cursor claim more
+                # progress than a sibling that genuinely read most of it.
+                failed_at.clear()
+                silent_sweeps += 1
+                if silent_sweeps >= sweeps_needed:
+                    raise UnusableDataSource(
+                        f'none of the {len(self.shard_urls)} shards could be '
+                        f'opened in {sweeps_needed} sweeps — data source unusable'
+                    )
+                continue
             # tolerate 2-element cursors (older releases, or state assigned
             # directly rather than through the constructor)
             cur = self.state[url]
@@ -193,14 +254,15 @@ class ResumableShardReader:
                 scanner = self.scanner_type(url)
                 n = len(scanner)
             except Exception as e:
-                logger.warning(f'skipping unreadable shard {url}: {e}')
-                self.state[url] = [epoch + 1, 0, known_n]
-                barren += 1
-                if barren >= len(self.shard_urls):
-                    raise RuntimeError(
-                        f'no shard produced a row in a full sweep over '
-                        f'{len(self.shard_urls)} shards — data source unusable'
-                    )
+                # leave the cursor alone: this shard has not been consumed, it
+                # could not be read. Skipping it for the rest of this sweep is
+                # enough to keep the stream moving, and it resumes exactly
+                # where it was once it comes back.
+                self._note_shard_problem(url, f'unreadable: {e}')
+                self._dead.add(url)
+                failed_at[url] = rows_out
+                silent_sweeps = self._note_quiet(url, quiet_shards, silent_sweeps,
+                                                 sweeps_needed, skipped)
                 continue
 
             if known_n >= 0 and known_n != n:
@@ -218,23 +280,97 @@ class ResumableShardReader:
                 )
                 start_row = 0
 
+            if n == 0:
+                self._note_shard_problem(url, 'empty')
+                self.state[url] = [epoch + 1, 0, n]
+                silent_sweeps = self._note_quiet(url, quiet_shards, silent_sweeps,
+                                                 sweeps_needed, skipped)
+                continue
+
+            # A shard whose cursor already sits at its last row is COMPLETE,
+            # not barren: it yields nothing now and rolls to the next epoch,
+            # where it will serve rows again. Cursors land there routinely —
+            # the row index advances before the yield, so any snapshot taken
+            # while paused on a shard's final row records exactly this state.
+            # Counting it as "no progress" turned an ordinary resume into a
+            # worker-killing RuntimeError.
+            self._dead.discard(url)          # it opened: no longer dead
             perm = self._row_perm(url, epoch, n)
-            produced = False
+            dropped = 0
+            last_error: Exception | None = None
             for r in range(start_row, n):
-                # advance BEFORE yielding: a generator pauses at yield, so a
-                # post-yield update would miss the last delivered row in any
-                # snapshot taken while paused (off-by-one replay on resume)
                 self.state[url][1] = r + 1
                 self.state[url][2] = n
-                produced = True
-                yield scanner[perm[r]]
-            self.state[url] = [epoch + 1, 0, n]
-            barren = 0 if produced else barren + 1
-            if barren >= len(self.shard_urls):
-                raise RuntimeError(
-                    f'no shard produced a row in a full sweep over '
-                    f'{len(self.shard_urls)} shards — data source unusable'
+                try:
+                    row = scanner[perm[r]]
+                except Exception as e:
+                    # a shard that opens but fails mid-read (truncated parquet,
+                    # corrupted row group) must not kill the worker. Counted
+                    # and reported once per shard: a shard where EVERY row
+                    # fails would otherwise emit a warning per row — measured
+                    # at ~120k lines/second — while making no progress at all.
+                    dropped += 1
+                    last_error = e
+                    continue
+                quiet_shards.clear()
+                silent_sweeps = 0
+                rows_out += 1
+                yield row
+            if dropped:
+                logger.warning(
+                    f'dropped {dropped}/{n - start_row} unreadable rows of '
+                    f'{url}; last error: {last_error}'
                 )
+            if dropped == n - start_row and n > start_row:
+                # opened fine, produced nothing: still a quiet shard
+                silent_sweeps = self._note_quiet(url, quiet_shards, silent_sweeps,
+                                                 sweeps_needed, skipped)
+            self.state[url] = [epoch + 1, 0, n]
+
+    def _note_shard_problem(self, url: str, why: str) -> None:
+        """Log a bad shard on a decaying schedule.
+
+        A failing shard is revisited every sweep, and the failure handler
+        advances its epoch, so throttling on (shard, epoch) never suppressed
+        anything — the pair could not repeat. Count the failures per shard
+        instead and report the 1st, 10th, 100th ... so a persistent problem
+        stays visible without turning into a flood.
+        """
+        n = self._problems.get(url, 0) + 1
+        self._problems[url] = n
+        if n == 1 or (n < 10 ** 9 and n in (10, 100, 1000, 10000)):
+            suffix = '' if n == 1 else f' (x{n})'
+        elif n % 10000 == 0:
+            suffix = f' (x{n})'
+        else:
+            return
+        logger.warning(f'skipping shard {url} — {why}{suffix}')
+
+    def _note_quiet(self, url: str, quiet_shards: set, silent_sweeps: int,
+                    sweeps_needed: int = 2, skipped: set | None = None) -> int:
+        """Record a shard that produced nothing and raise if the stream is
+        genuinely stuck.
+
+        A sweep ends when every shard has been quiet at least once since the
+        last row; two sweeps in a row with no row at all means nothing here
+        can produce. Repeat visits to the same lagging shard do not count
+        twice — that is the epoch-gap false positive."""
+        quiet_shards.add(url)
+        # A shard held back by the retry throttle is as silent as an empty one.
+        # Counting only `quiet_shards` let a slice with one unreadable and one
+        # empty shard satisfy neither this test nor the all-skipped test — the
+        # two sets are disjoint by construction — and spin at 470k visits/s.
+        seen_quiet = quiet_shards | (skipped or set())
+        if seen_quiet >= set(self.shard_urls):
+            quiet_shards.clear()
+            silent_sweeps += 1
+            if silent_sweeps >= sweeps_needed:
+                raise UnusableDataSource(
+                    f'no row came out of any of the {len(self.shard_urls)} shards '
+                    f'in two full sweeps (unreadable, empty, or every row '
+                    f'failing) — data source unusable'
+                )
+        return silent_sweeps
 
     def is_countable(self) -> bool:
         return False        # infinite by construction
@@ -273,6 +409,19 @@ class RowMapFunctionError(Exception):
 
 class RowFlowFunctionError(Exception):
     ...
+
+
+class UnusableDataSource(RuntimeError):
+    """The source itself cannot serve data — not a bad row.
+
+    ``ignore_error`` exists to skip individual poisoned rows, so every other
+    exception is downgraded to a sentinel the worker drops. That is exactly
+    wrong for a source-level failure: the sentinel is dropped, a fresh
+    iterator is built over the same dead source, and the pipeline spins at
+    zero throughput reporting nothing. This one is never downgraded.
+
+    Subclasses RuntimeError so existing handlers still catch it.
+    """
 
 
 class FlowIterator(Iterator[Row | RowMapFunctionError | RowFlowFunctionError]):
@@ -318,11 +467,17 @@ class FlowIterator(Iterator[Row | RowMapFunctionError | RowFlowFunctionError]):
             self._flow = self._open_flow()
         try:
             return next(self._flow)
-        except StopIteration as e:
-            # a generator that raised is dead; the next call re-opens over the
-            # same (possibly still live) source
+        except StopIteration:
+            # exhaustion is terminal for this iterator: re-opening here would
+            # resurrect a flow that emits on empty input (flush/sentinel
+            # patterns alternate forever). DataFlow.__iter__ mints a new
+            # FlowIterator when the caller genuinely wants another pass.
+            raise
+        except UnusableDataSource:
+            # never downgraded to a sentinel: the caller would drop it, build
+            # a fresh iterator over the same dead source, and spin forever
             self._flow = None
-            raise e
+            raise
         except RowMapFunctionError as e:
             self._flow = None
             if self.allow_error:

@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader as Loader
 
 from .data_distributor import DataDistributor
 from .interfaces import Batch, Row, Index
-from .utils import mix_iterables
+from .utils import mix_iterables, slowest_epoch
 from .scanners import Scanner
 from .data_operators import CombinedReader
 
@@ -138,6 +138,12 @@ class DataLoader:
         else:
             assert len(self.distributors) == len(distributor_weights), \
                 "The number of distributors and weights must be the same."
+            # Caught here rather than at the first read, where `random.choices`
+            # raises "Total of weights must be greater than zero" from inside
+            # the mixing helper with no clue which loader was misconfigured.
+            assert any(w > 0 for w in distributor_weights), \
+                (f'every source weight is zero ({distributor_weights}), so no '
+                 f'source would ever be drawn from')
             self.distributor_weights = distributor_weights
 
         self.distributor_index = 0
@@ -146,7 +152,15 @@ class DataLoader:
 
     @property
     def epoch(self) -> int:
-        return max([distributor.epoch for distributor in self.distributors])
+        """Completed epochs = the SLOWEST source's. See `slowest_epoch`.
+
+        Sources carry mixing weights and a weight of 0.0 means the source is
+        never drawn, so it is excluded rather than stalling the epoch forever.
+        """
+        return slowest_epoch(
+            [distributor.epoch for distributor in self.distributors],
+            self.distributor_weights,
+        )
 
     def __iter__(self) -> Iterator[Batch]:
         current_epoch = self.epoch
@@ -170,9 +184,16 @@ class DataLoader:
                 self.current_batch = []
 
             row = next(stream)
-            self.current_batch.append(row)
             if self.epoch > current_epoch:
+                # This row already belongs to the NEXT epoch: mix_iterables
+                # restarts an exhausted distributor and hands back its first
+                # row, and the epoch counter moves with it. Appending it kept
+                # it in current_batch across the break while the freshly built
+                # stream in the next __iter__ served it again — one duplicated
+                # row at every epoch boundary, every epoch. Drop it here; the
+                # next epoch's stream is where it belongs.
                 break
+            self.current_batch.append(row)
 
     def current_index(self) -> list[list[Index]]:
         return [[worker.index for worker in distriubtor.workers] for distriubtor in self.distributors]
@@ -180,7 +201,11 @@ class DataLoader:
     def states(self) -> bytes:
         return pickle.dumps({
             'batch_size': self.batch_size,
-            'path_list': self.distributors[0].path,
+            # One path PER distributor. This stored distributors[0].path — a
+            # single string — which __init__ then zipped against `indexes`,
+            # iterating it character by character: the resumed distributor's
+            # path came out as '/' and resume died with IsADirectoryError.
+            'path_list': [distributor.path for distributor in self.distributors],
             'scanner_type': self.distributors[0].scanner_type,
             'seed': self.seed,
             'shuffle': self.distributors[0].shuffle,
@@ -208,6 +233,35 @@ class DataLoader:
         return DataLoader(**states) # type: ignore
 
 
+class _ExactPartitionSampler:
+    """Every row exactly once across ranks, with no padding.
+
+    Rank counts then differ by at most one, which `tensor_all_gather` handles.
+    """
+
+    def __init__(self, size: int, num_ranks: int, rank_idx: int,
+                 shuffle: bool, seed: int) -> None:
+        self.size = size
+        self.num_ranks = num_ranks
+        self.rank_idx = rank_idx
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __len__(self) -> int:
+        return len(range(self.rank_idx, self.size, self.num_ranks))
+
+    def __iter__(self):
+        order = list(range(self.size))
+        if self.shuffle:
+            import random as _random
+            _random.Random(f'{self.seed}:{self.epoch}').shuffle(order)
+        return iter(order[self.rank_idx::self.num_ranks])
+
+
 class PyTorchDataLoader:
     def __init__(
         self,
@@ -221,7 +275,8 @@ class PyTorchDataLoader:
         num_ranks: int = 1,
         rank_idx: int = 0,
         collate_fn: Callable[[list[Row]], Batch] | None = None,
-        drop_last: bool = False
+        drop_last: bool = False,
+        exact_pass: bool = False
     ) -> None:
         self.batch_size = batch_size
         self.path_list = path_list
@@ -240,14 +295,25 @@ class PyTorchDataLoader:
 
         self.dataset = CombinedReader(scanner_type=self.scanner_type, path_list=self.path_list) # type: ignore
         if num_ranks > 1:
-            sampler = DistributedSampler(
-                self.dataset,  # type: ignore
-                num_replicas=num_ranks, 
-                rank=rank_idx, 
-                shuffle=shuffle, 
-                seed=seed, 
-                drop_last=drop_last
-            )
+            sampler: Any
+            if exact_pass:
+                # DistributedSampler pads the last rank by repeating rows from
+                # the start so every rank gets the same count. For an eval set
+                # that means the padded rows are gathered and scored twice: a
+                # 99-row dev set on 4 GPUs contributes 102 predictions, so the
+                # SAME checkpoint scores differently depending on how many GPUs
+                # ran the evaluation. This partition covers each row once.
+                sampler = _ExactPartitionSampler(
+                    len(self.dataset), num_ranks, rank_idx, shuffle, seed)
+            else:
+                sampler = DistributedSampler(
+                    self.dataset,  # type: ignore
+                    num_replicas=num_ranks,
+                    rank=rank_idx,
+                    shuffle=shuffle,
+                    seed=seed,
+                    drop_last=drop_last
+                )
             dataloader = Loader(
                 dataset=self.dataset, # type: ignore
                 batch_size=batch_size,

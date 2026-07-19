@@ -41,17 +41,24 @@ import multiprocessing as mp
 import os
 import logging
 import queue as queue_mod
+import pickle
 
 import numpy as np
 import torch
 import requests
+
+# (connect, read) seconds. Without a timeout a stalled HTTP fetch — no RST,
+# no data — hangs the worker forever: @retry never engages because nothing
+# raises, and the livelock guard never runs because the iterator never
+# returns. The read budget is per socket read, so large shards are fine.
+_HTTP_TIMEOUT = (10, 120)
 from torch.multiprocessing import Process, Queue
 
 from .interfaces import Batch, Row
 from .scanners import Scanner
 from .data_operators import ResumableShardReader, DataFlow
 from .data_loader import _collate_fn
-from .utils import split_list
+from .utils import split_list, slowest_epoch
 
 logger = logging.getLogger(__name__)
 
@@ -62,13 +69,46 @@ def _read_shard_lines(path: str | os.PathLike) -> list[str]:
     """One line per shard, from a local file or an https:// url (same contract
     as ``DataDistributor.init_path_lists``)."""
     if str(path).startswith('https://'):
-        resp = requests.get(str(path))
+        resp = requests.get(str(path), timeout=_HTTP_TIMEOUT)
         resp.raise_for_status()
         lines = resp.content.decode('utf-8').splitlines()
     else:
         with open(path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
     return [ln.strip() for ln in lines if len(ln.strip()) > 0]
+
+
+def rows_consumed(cursor: list[int]) -> tuple:
+    """How far a cursor has actually read, for comparing two cursors on the
+    same shard.
+
+    `(epoch, next_row)` is not that: a shard whose epoch was bumped because it
+    could not be READ sits at `[epoch + 1, 0]` and would beat a sibling that
+    legitimately read most of the epoch. When the row count is known, total
+    rows is the honest measure; without it (a 2-element cursor from 0.3.0)
+    fall back to the pair, which is right whenever the epochs match.
+    """
+    epoch, next_row = cursor[0], cursor[1]
+    known_n = cursor[2] if len(cursor) > 2 else -1
+    if known_n >= 0:
+        return (epoch * known_n + next_row,)
+    return (epoch, next_row)
+
+
+def merge_cursors(into: dict[str, list[int]], cursors: dict[str, list[int]]) -> None:
+    """Merge one shard-cursor table into another, keeping the furthest.
+
+    Consumers own disjoint shards EXCEPT on the round-robin fallback (a source
+    with fewer shards than consumers), where several play the same shard.
+    Last-writer-wins there kept whichever consumer happened to be enumerated
+    last rather than the one that had read furthest — measured rewinding 25
+    rows. Exported so the runner merging across RANKS uses the same rule as
+    the loader merging across workers; they used to disagree.
+    """
+    for url, cur in cursors.items():
+        have = into.get(url)
+        if have is None or rows_consumed(cur) > rows_consumed(have):
+            into[url] = list(cur)
 
 
 def _to_numpy(value: Any) -> np.ndarray | None:
@@ -173,12 +213,30 @@ def _batch_worker_loop(
                 # the stream up to this batch (in-flight reads are skipped, i.e.
                 # a resume loses at most the buffered windows, never repeats)
                 cursors = [r.snapshot() for r in readers]
+                # mp.Queue pickles on a background feeder thread, so an
+                # unpicklable payload raises THERE: put() returns normally,
+                # nothing is delivered, and the slot is lost while the worker
+                # stays alive — the ring drains until every worker blocks and
+                # the consumer reports a timeout with "N workers alive".
+                # Moving the call inside this try does not help; the payload
+                # has to be checked before it is handed over. Only `objects`
+                # can hold arbitrary values (tensors travel through shm), and
+                # it is small, so the probe is cheap.
+                if objects:
+                    try:
+                        pickle.dumps(objects)
+                    except Exception as e:
+                        raise RuntimeError(
+                            f'batch field(s) {sorted(objects)} cannot be sent to '
+                            f'the consumer: {e}. Return tensors or plain '
+                            f'picklable values from collate_fn.'
+                        ) from e
+                ready_q.put((slot, specs, objects, epoch, worker_id, cursors))
             except BaseException:
                 # a slot acquired and never handed on is lost for the process
                 # lifetime; enough of those and every worker blocks on free_q
                 free_q.put(slot)
                 raise
-            ready_q.put((slot, specs, objects, epoch, worker_id, cursors))
     except Exception:
         logger.exception(f'[batch-worker {worker_id}] fatal error, exiting')
         raise
@@ -294,10 +352,16 @@ class BatchDataLoader:
         self.worker_timeout = worker_timeout
         self.batch_size = batch_size
         self._epoch = 0
+        # Latest epoch reported by each worker. The loader's epoch is the
+        # SLOWEST of these — see slowest_epoch. A worker that has not reported
+        # yet counts as 0, which is exactly right: it has not finished its
+        # first pass.
+        self._worker_epochs: dict[int, int] = {w: 0 for w in range(num_workers)}
         # liveness polling cadence on the happy path (is_alive() is a cheap
         # waitpid; once per ring-depth of batches is plenty)
         self._check_every = max(num_workers, 1)
         self._since_check = 0
+        self._closed = False
 
         # latest cursor snapshot per worker (payload of the last CONSUMED
         # batch) — the basis of state_dict()
@@ -334,6 +398,8 @@ class BatchDataLoader:
         """A dead worker takes its shard slice with it: the survivors keep the
         queue full, so training continues on a silently shrunken corpus with a
         skewed source mixture. Surface it instead."""
+        if getattr(self, '_closed', False):
+            return          # we sent those SIGTERMs ourselves
         dead = [i for i, p in enumerate(self.workers) if not p.is_alive()]
         if dead:
             raise RuntimeError(
@@ -344,15 +410,29 @@ class BatchDataLoader:
 
     def __iter__(self) -> Iterator[Batch]:
         while True:
-            try:
-                slot, specs, objects, ep, worker_id, cursors = \
-                    self.ready_q.get(timeout=self.worker_timeout)
-            except queue_mod.Empty:
+            # Poll in slices rather than one long blocking wait: dead workers
+            # are only noticed on the happy path or on a timeout, so with the
+            # generous worker_timeout a streaming source needs (an hour, in
+            # the pretrain configs) a source that dies takes that long to be
+            # reported — as a timeout, which points at the wrong thing.
+            deadline = self.worker_timeout
+            got = None
+            while deadline is None or deadline > 0:
+                slice_s = 15.0 if deadline is None else min(15.0, deadline)
+                try:
+                    got = self.ready_q.get(timeout=slice_s)
+                    break
+                except queue_mod.Empty:
+                    self._check_workers()       # raises if any worker died
+                    if deadline is not None:
+                        deadline -= slice_s
+            if got is None:
                 self._check_workers()
                 raise TimeoutError(
                     f'no batch arrived within {self.worker_timeout}s '
                     f'({sum(p.is_alive() for p in self.workers)} workers alive)'
                 )
+            slot, specs, objects, ep, worker_id, cursors = got
             base = slot * self.slot_nbytes
             batch: Batch = {}
             for key, (dtype, shape, off) in specs.items():
@@ -360,7 +440,14 @@ class BatchDataLoader:
                 batch[key] = torch.from_numpy(src.copy())   # one memcpy; slot freed below
             batch.update(objects)
             self.free_q.put(slot)
-            self._epoch = max(self._epoch, ep)
+            # `max` here let the FASTEST worker declare the epoch over for the
+            # whole loader: a 3-row shard beside a 400-row shard rolled the
+            # epoch after 4 batches with 0/400 rows of the large shard seen,
+            # and reached epoch 20 while the large shard was still untouched.
+            # This is the same defect 0.3.13 removed from the other three axes;
+            # this fourth one is the loader pretraining actually uses.
+            self._worker_epochs[worker_id] = ep
+            self._epoch = slowest_epoch(list(self._worker_epochs.values()))
             self._worker_cursors[worker_id] = cursors
             self._since_check += 1
             if self._since_check >= self._check_every:
@@ -372,24 +459,27 @@ class BatchDataLoader:
         """Merged shard-cursor table for this rank:
         ``{source_key: {shard_url: [epoch, next_row]}}``.
 
-        Reflects the stream up to the last batch CONSUMED from each worker;
-        rows the workers read ahead (flow buffers, shm ring) are past these
-        cursors, so resuming from the table skips them — bounded loss, no
-        repetition. Merge the per-rank tables (plain dict union — every shard
-        is owned by exactly one consumer) before persisting a global one."""
+        Reflects the stream up to the last batch each worker HANDED OVER —
+        which is not the same as the last batch trained on. Rows still inside
+        the flow buffers and the shm ring are past these cursors, and so is
+        anything a consumer-side prefetcher has pulled but not yet used (the
+        runner's device prefetch runs up to three batches ahead). Resuming
+        therefore skips a bounded number of rows and never repeats any.
+
+        Merge per-rank tables with :func:`merge_cursors`, which keeps the
+        furthest cursor per shard. Ranks own disjoint shards except on the
+        round-robin fallback, where several consumers share one and the
+        furthest-wins rule decides."""
         table: dict[str, dict[str, list[int]]] = {k: {} for k in self.source_keys}
         for w, states in enumerate(self._initial_states):
             per_source = self._worker_cursors.get(w)
-            if per_source is None:
-                # worker not consumed from yet: fall back to its start state
-                for s, key in enumerate(self.source_keys):
-                    table[key].update(states[s] or {})
-            else:
-                for s, key in enumerate(self.source_keys):
-                    table[key].update(per_source[s])
+            for s, key in enumerate(self.source_keys):
+                merge_cursors(table[key], (states[s] or {}) if per_source is None
+                              else per_source[s])
         return table
 
     def close(self) -> None:
+        self._closed = True
         for p in getattr(self, 'workers', []):
             if p.is_alive():
                 p.terminate()

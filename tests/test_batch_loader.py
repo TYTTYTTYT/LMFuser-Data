@@ -218,11 +218,54 @@ def bench_vs_row_loader():
           f'row-loader: {N*B/t_row:8.0f} rows/s   speedup x{t_row/t_batch:.2f}')
 
 
+def test_epoch_waits_for_the_slowest_worker():
+    """The loader's epoch must not roll while a worker is still on its first pass.
+
+    `max(self._epoch, ep)` let the FASTEST worker declare the epoch over for
+    the whole loader: a 3-row shard beside a 400-row shard rolled the epoch
+    after 4 batches with 0/400 rows of the large shard seen, and reached epoch
+    20 while the large shard was still untouched. This is the fourth axis of
+    the same defect lmfuser-data 0.3.13 removed from the other three — and it
+    is the loader the pretraining configs use.
+    """
+    shard_paths = []
+    for name, n_rows in (('tiny', 3), ('huge', 400)):
+        p = os.path.join(TMP, f'uneven_{name}.tsv')
+        with open(p, 'w') as fh:
+            fh.write('source\trow_id\tvalue\n')
+            for r in range(n_rows):
+                fh.write(f'{name}\t{r}\t1\n')
+        shard_paths.append(p)
+    lst = os.path.join(TMP, 'uneven_shards.txt')
+    with open(lst, 'w') as fh:
+        fh.write('\n'.join(shard_paths))
+
+    dl = BatchDataLoader(
+        batch_size=4, path_list=[lst], scanner_type='TSVScanner',
+        seed=3, shuffle=False, map_fn=row_to_tensor,
+        num_workers=2, queue_depth=2, slot_mb=4,
+    )
+    it = iter(dl)
+    big_seen = set()
+    for _ in range(40):
+        batch = next(it)
+        for src, rid in zip(batch['source'], batch['row_id']):
+            if src == 'huge':
+                big_seen.add(int(rid))
+        assert dl.epoch == 0, (
+            f'epoch rolled to {dl.epoch} with only {len(big_seen)}/400 rows of '
+            f'the large shard seen — the fast worker closed the epoch')
+    close(dl)
+    print(f'PASS epoch waits for the slowest worker '
+          f'({len(big_seen)}/400 large-shard rows in, epoch still 0)')
+
+
 if __name__ == '__main__':
     test_basic_and_strings()
     test_mixture_weights()
     test_flow_split_merge_and_errors()
     test_sharding_disjoint()
     test_teardown()
+    test_epoch_waits_for_the_slowest_worker()
     bench_vs_row_loader()
     print('ALL_TESTS_PASS')

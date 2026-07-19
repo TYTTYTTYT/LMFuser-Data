@@ -3,6 +3,7 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 import os
 import logging
+import queue as queue_mod
 import time
 import signal
 from copy import deepcopy
@@ -15,6 +16,22 @@ from .scanners import Scanner
 from .data_operators import Index, ShardedReader, DataFlow
 
 logger = logging.getLogger(__name__)
+
+# mp.Queue.get(timeout=) raises queue.Empty and put(timeout=) raises queue.Full;
+# neither subclasses TimeoutError, so every `except TimeoutError` in this file
+# was dead code — the diagnostics never printed and a bare queue.Empty escaped
+# to the caller instead.
+_QUEUE_TIMEOUTS = (queue_mod.Empty, queue_mod.Full, TimeoutError)
+
+
+class WorkerTimeout(TimeoutError):
+    """A worker did not answer in time.
+
+    Raised instead of letting a bare `queue.Empty` — whose str() is the empty
+    string — escape to the training loop. The most common cause is a source
+    that cannot produce anything (an empty or missing shard), which otherwise
+    surfaces as an exception with no message at all.
+    """
 
 
 class WorkerInstruct:
@@ -90,6 +107,12 @@ def _worker_loop(
     while True:
         try:
             instruct = instruct_queue.get(timeout=instruct_timeout)
+        except _QUEUE_TIMEOUTS:
+            # Idle, not broken. The consumer can legitimately be quiet for a
+            # long time — a multi-GB checkpoint save, a long eval — and
+            # exiting here left the parent to discover a dead worker much
+            # later, or not at all.
+            continue
         except Exception as e:
             logger.critical(f"Worker {os.getpid()} timed out waiting for instruction: {e}")
             return
@@ -228,9 +251,11 @@ class RowWorker:
             worker_info = self.result_queue.get(timeout=self.worker_timeout)
             assert isinstance(worker_info, WorkerInfo)
             self.worker_info = worker_info
-        except TimeoutError as e:
-            logger.error(f"Worker timed out waiting for worker info: {e}")
-            raise e
+        except _QUEUE_TIMEOUTS as e:
+            raise WorkerTimeout(
+                f'worker for {self.path_list[:2]}{"..." if len(self.path_list) > 2 else ""} '
+                f'did not report back within {self.worker_timeout}s of starting'
+            ) from e
 
     def check_alive(self) -> bool:
         return self.worker.is_alive()
@@ -243,9 +268,11 @@ class RowWorker:
         self._try_start()
         try:
             self.instruct_queue.put(Seek(index.epoch, index.part, index.row), timeout=self.worker_timeout)
-        except TimeoutError as e:
-            logger.error(f"Worker timed out waiting for seek instruction: {index}")
-            raise e
+        except _QUEUE_TIMEOUTS as e:
+            raise WorkerTimeout(
+                f'worker did not accept a seek to {index} within '
+                f'{self.worker_timeout}s'
+            ) from e
         self.queue_size += 1
 
         item = None
@@ -254,9 +281,11 @@ class RowWorker:
                 item = self.result_queue.get(timeout=self.worker_timeout)
                 index = self.index_queue.get(timeout=self.worker_timeout)
                 self.queue_size -= 1
-            except TimeoutError as e:
-                logger.error(f"Worker timed out waiting for index: {index}")
-                raise e
+            except _QUEUE_TIMEOUTS as e:
+                raise WorkerTimeout(
+                    f'worker produced no row within {self.worker_timeout}s '
+                    f'while seeking {index} — is this source empty?'
+                ) from e
 
         self.index = index
 
@@ -273,12 +302,12 @@ class RowWorker:
                 self.result_queue.get(timeout=self.worker_timeout)
                 self.index_queue.get(timeout=self.worker_timeout)
                 self.queue_size -= 1
-            except TimeoutError as e:
+            except _QUEUE_TIMEOUTS as e:
                 logger.error(f"Worker timed out waiting for clearing the result queue.")
                 raise e
         try:
             self.instruct_queue.put(ResetIter(), timeout=self.worker_timeout)
-        except TimeoutError as e:
+        except _QUEUE_TIMEOUTS as e:
             logger.error(f"Worker timed out waiting for reset iter instruction: {e}")
             raise e
 
@@ -289,7 +318,7 @@ class RowWorker:
             try:
                 self.instruct_queue.put(NextIter(), timeout=self.worker_timeout)
                 self.queue_size += 1
-            except TimeoutError as e:
+            except _QUEUE_TIMEOUTS as e:
                 logger.error(f"Worker timed out waiting for next iter instruction: {e}")
                 raise e
 
@@ -305,7 +334,7 @@ class RowWorker:
             try:
                 self.instruct_queue.put(NextIter(), timeout=self.worker_timeout)
                 self.queue_size += 1
-            except TimeoutError as e:
+            except _QUEUE_TIMEOUTS as e:
                 logger.error(f"Worker timed out waiting for next iter instruction: {e}")
                 raise e
 
@@ -313,9 +342,12 @@ class RowWorker:
                 item = self.result_queue.get(timeout=self.worker_timeout)
                 index = self.index_queue.get(timeout=self.worker_timeout)
                 self.queue_size -= 1
-            except TimeoutError as e:
-                logger.error(f"Worker timed out waiting for the next iteration.")
-                raise e
+            except _QUEUE_TIMEOUTS as e:
+                raise WorkerTimeout(
+                    f'no row within {self.worker_timeout}s from the worker for '
+                    f'{self.path_list[:2]}{"..." if len(self.path_list) > 2 else ""} '
+                    f'— an empty or unreadable source looks exactly like this'
+                ) from e
 
             assert isinstance(index, Index)
             if index.epoch == cur_epoch:
@@ -331,6 +363,10 @@ class RowWorker:
     def __del__(self):
         """Destructor: ensure cleanup even if user forgets."""
         try:
+            # startup can fail before `worker` exists; a destructor that raises
+            # only produces "Exception ignored in __del__" noise
+            if getattr(self, 'worker', None) is None:
+                return
             if self.worker.is_alive():
                 self.worker.terminate()
                 self.worker.join(timeout=30.0)

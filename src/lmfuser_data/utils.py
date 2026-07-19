@@ -132,3 +132,37 @@ def retry(
         return cast(F, f_retry)
 
     return deco_retry
+
+
+def slowest_epoch(epochs: Sequence[int], weights: Sequence[float] | None = None) -> int:
+    """Completed epochs across independently-progressing members.
+
+    `max` reports an epoch as soon as the FASTEST member has been round, so a
+    small shard next to a large one ends the epoch for everybody and the large
+    one is never covered: 3 rows and 12 rows in one source delivered S 3x and
+    L 9/12 over three "epochs".
+
+    `min` alone is not enough either. A member with weight 0.0 is never drawn,
+    so its epoch stays at 0 and the minimum never advances — the epoch never
+    ends and `stop_by: epoch` never stops. Weight 0.0 is a legal config value
+    (`FloatArg(1.0, min_value=0.0)`), so this is reachable, not theoretical.
+
+    So: the minimum over members that can actually progress. This is the one
+    definition used on all three axes it applies to — workers within a source
+    (DataDistributor), sources within a loader (DataLoader), and tasks within
+    a run (DDPRunner) — because the bug is the same shape on each, and fixing
+    one axis at a time is how it survived the first attempt.
+    """
+    if not epochs:
+        return 0
+    if weights is None:
+        return min(epochs)
+    assert len(weights) == len(epochs), \
+        f'{len(epochs)} epochs but {len(weights)} weights'
+    live = [e for e, w in zip(epochs, weights) if w > 0]
+    # Every weight zero is rejected by the caller at construction time (see
+    # DataLoader.__init__): nothing would ever be drawn, and `random.choices`
+    # raises an opaque "Total of weights must be greater than zero" the first
+    # time the stream is read. The plain minimum here is only a defensive
+    # fallback so this helper is total, not a supported configuration.
+    return min(live) if live else min(epochs)

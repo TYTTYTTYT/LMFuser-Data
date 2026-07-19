@@ -88,7 +88,12 @@ class SubclassTracer:
         """
         Get the subclass according to the name.
         """
-        subclasses = cls.direct_subclass_map()
+        # Resolve against ALL subclasses, not just direct children. Config
+        # validation lists options from all_subclass_names() and the sibling
+        # resolvers (ModelLoader.from_pretrained, TaskBase) use all_subclass_map,
+        # so resolving from direct_subclass_map here alone made a nested
+        # subclass pass validation and then fail construction with a KeyError.
+        subclasses = cls.all_subclass_map()
         if name not in subclasses:
             raise KeyError(f"Subclass '{name}' not found in {cls.__name__}.")
         return subclasses[name]
