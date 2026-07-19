@@ -157,9 +157,12 @@ class ResumableShardReader:
         """Completed epochs = the minimum epoch across owned shards."""
         return min(v[0] for v in self.state.values())
 
-    def _next_shard(self) -> str:
-        min_epoch = min(v[0] for v in self.state.values())
-        candidates = [u for u in self.shard_urls if self.state[u][0] == min_epoch]
+    def _next_shard(self, skip: set | None = None) -> str | None:
+        pool = [u for u in self.shard_urls if not skip or u not in skip]
+        if not pool:
+            return None                      # everything is being skipped
+        min_epoch = min(self.state[u][0] for u in pool)
+        candidates = [u for u in pool if self.state[u][0] == min_epoch]
         if self.shuffle:
             order = sorted(candidates)
             random.Random(f'{self.order_seed}:{min_epoch}').shuffle(order)
@@ -196,6 +199,7 @@ class ResumableShardReader:
         # it catches up. Counting visits made that look like a stuck stream
         # and killed workers that still had thousands of readable rows.
         quiet_shards: set[str] = set()
+        skipped: set[str] = set()
         silent_sweeps = 0
         # A slice can be a single shard (a source with fewer shards than
         # consumers), where two sweeps means two consecutive failed opens —
@@ -203,7 +207,21 @@ class ResumableShardReader:
         # number of quiet visits before declaring the source dead.
         sweeps_needed = max(2, -(-_MIN_QUIET_VISITS // len(self.shard_urls)))
         while True:
-            url = self._next_shard()
+            url = self._next_shard(skipped)
+            if url is None:
+                # every shard failed to open this sweep. Retry them all rather
+                # than advancing anyone's epoch: a shard that could not be READ
+                # has not been consumed, and pretending otherwise both loses
+                # the rest of its epoch and makes its cursor claim more
+                # progress than a sibling that genuinely read most of it.
+                skipped.clear()
+                silent_sweeps += 1
+                if silent_sweeps >= sweeps_needed:
+                    raise UnusableDataSource(
+                        f'none of the {len(self.shard_urls)} shards could be '
+                        f'opened in {sweeps_needed} sweeps — data source unusable'
+                    )
+                continue
             # tolerate 2-element cursors (older releases, or state assigned
             # directly rather than through the constructor)
             cur = self.state[url]
@@ -215,9 +233,12 @@ class ResumableShardReader:
                 scanner = self.scanner_type(url)
                 n = len(scanner)
             except Exception as e:
+                # leave the cursor alone: this shard has not been consumed, it
+                # could not be read. Skipping it for the rest of this sweep is
+                # enough to keep the stream moving, and it resumes exactly
+                # where it was once it comes back.
                 self._note_shard_problem(url, f'unreadable: {e}')
-                self.state[url] = [epoch + 1, 0, known_n]
-                silent_sweeps = self._note_quiet(url, quiet_shards, silent_sweeps, sweeps_needed)
+                skipped.add(url)
                 continue
 
             if known_n >= 0 and known_n != n:
@@ -266,6 +287,7 @@ class ResumableShardReader:
                     last_error = e
                     continue
                 quiet_shards.clear()
+                skipped.clear()      # progress: give the failed shards another go
                 silent_sweeps = 0
                 yield row
             if dropped:

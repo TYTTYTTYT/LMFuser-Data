@@ -78,6 +78,39 @@ def _read_shard_lines(path: str | os.PathLike) -> list[str]:
     return [ln.strip() for ln in lines if len(ln.strip()) > 0]
 
 
+def rows_consumed(cursor: list[int]) -> tuple:
+    """How far a cursor has actually read, for comparing two cursors on the
+    same shard.
+
+    `(epoch, next_row)` is not that: a shard whose epoch was bumped because it
+    could not be READ sits at `[epoch + 1, 0]` and would beat a sibling that
+    legitimately read most of the epoch. When the row count is known, total
+    rows is the honest measure; without it (a 2-element cursor from 0.3.0)
+    fall back to the pair, which is right whenever the epochs match.
+    """
+    epoch, next_row = cursor[0], cursor[1]
+    known_n = cursor[2] if len(cursor) > 2 else -1
+    if known_n >= 0:
+        return (epoch * known_n + next_row,)
+    return (epoch, next_row)
+
+
+def merge_cursors(into: dict[str, list[int]], cursors: dict[str, list[int]]) -> None:
+    """Merge one shard-cursor table into another, keeping the furthest.
+
+    Consumers own disjoint shards EXCEPT on the round-robin fallback (a source
+    with fewer shards than consumers), where several play the same shard.
+    Last-writer-wins there kept whichever consumer happened to be enumerated
+    last rather than the one that had read furthest — measured rewinding 25
+    rows. Exported so the runner merging across RANKS uses the same rule as
+    the loader merging across workers; they used to disagree.
+    """
+    for url, cur in cursors.items():
+        have = into.get(url)
+        if have is None or rows_consumed(cur) > rows_consumed(have):
+            into[url] = list(cur)
+
+
 def _to_numpy(value: Any) -> np.ndarray | None:
     if isinstance(value, torch.Tensor):
         return value.detach().cpu().numpy()
@@ -414,21 +447,23 @@ class BatchDataLoader:
         """Merged shard-cursor table for this rank:
         ``{source_key: {shard_url: [epoch, next_row]}}``.
 
-        Reflects the stream up to the last batch CONSUMED from each worker;
-        rows the workers read ahead (flow buffers, shm ring) are past these
-        cursors, so resuming from the table skips them — bounded loss, no
-        repetition. Merge the per-rank tables (plain dict union — every shard
-        is owned by exactly one consumer) before persisting a global one."""
+        Reflects the stream up to the last batch each worker HANDED OVER —
+        which is not the same as the last batch trained on. Rows still inside
+        the flow buffers and the shm ring are past these cursors, and so is
+        anything a consumer-side prefetcher has pulled but not yet used (the
+        runner's device prefetch runs up to three batches ahead). Resuming
+        therefore skips a bounded number of rows and never repeats any.
+
+        Merge per-rank tables with :func:`merge_cursors`, which keeps the
+        furthest cursor per shard. Ranks own disjoint shards except on the
+        round-robin fallback, where several consumers share one and the
+        furthest-wins rule decides."""
         table: dict[str, dict[str, list[int]]] = {k: {} for k in self.source_keys}
         for w, states in enumerate(self._initial_states):
             per_source = self._worker_cursors.get(w)
-            if per_source is None:
-                # worker not consumed from yet: fall back to its start state
-                for s, key in enumerate(self.source_keys):
-                    table[key].update(states[s] or {})
-            else:
-                for s, key in enumerate(self.source_keys):
-                    table[key].update(per_source[s])
+            for s, key in enumerate(self.source_keys):
+                merge_cursors(table[key], (states[s] or {}) if per_source is None
+                              else per_source[s])
         return table
 
     def close(self) -> None:
