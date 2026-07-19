@@ -233,8 +233,15 @@ class FlowIterator(Iterator[Row | RowMapFunctionError | RowFlowFunctionError]):
         self.map_fn = map_fn
         self.flow_fn = flow_fn
         self.allow_error = allow_error
+        # The flow is opened ONCE and kept: a flow function may buffer input
+        # rows and emit several rows per group (packing, windowing, splitting),
+        # and rebuilding it per __next__ would throw away everything it had
+        # already produced but not yet handed out. Measured on a pixel-LM
+        # packing flow that renders 8 windows per call: 8x the rendering work
+        # and 8x the rows pulled from the reader, for one row consumed.
+        self._flow: Iterator[Row] | None = None
 
-    def __next__(self) -> Row | RowMapFunctionError | RowFlowFunctionError:
+    def _open_flow(self) -> Iterator[Row]:
         def _map_stream(
             source: Iterator[Row], 
             map_fn: Callable[[Row], Row]
@@ -250,19 +257,27 @@ class FlowIterator(Iterator[Row | RowMapFunctionError | RowFlowFunctionError]):
                 except Exception as e:
                     raise RowMapFunctionError(f"Row mapping function failed: {e}")
 
-        it = iter(self.flow_fn(_map_stream(self.source, self.map_fn)))
+        return iter(self.flow_fn(_map_stream(self.source, self.map_fn)))
+
+    def __next__(self) -> Row | RowMapFunctionError | RowFlowFunctionError:
+        if self._flow is None:
+            self._flow = self._open_flow()
         try:
-            result = next(it)
-            return result
+            return next(self._flow)
         except StopIteration as e:
+            # a generator that raised is dead; the next call re-opens over the
+            # same (possibly still live) source
+            self._flow = None
             raise e
         except RowMapFunctionError as e:
+            self._flow = None
             if self.allow_error:
                 logger.warning(f'Ignore error in map function: {e}')
                 return e
             else:
                 raise e
         except Exception as e:
+            self._flow = None
             if self.allow_error:
                 logger.warning(f'Ignore error in flow function: {e}')
                 return RowFlowFunctionError(f"Row flow function failed: {e}")
