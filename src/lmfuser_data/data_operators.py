@@ -136,18 +136,23 @@ class ResumableShardReader:
         self.row_seed = row_seed
         self.order_seed = order_seed
         self.shuffle = shuffle
-        # cursor: url -> [epoch, next_row]; next_row indexes the PERMUTED order
-        self.state: dict[str, list[int]] = {
-            url: list((state or {}).get(url, [0, 0])) for url in self.shard_urls
-        }
+        # cursor: url -> [epoch, next_row, nrows]; next_row indexes the
+        # PERMUTED order, nrows is the row count the cursor was taken against
+        # (-1 = unknown, e.g. a 2-element cursor from an older release)
+        self.state: dict[str, list[int]] = {}
+        for url in self.shard_urls:
+            cur = list((state or {}).get(url, [0, 0, -1]))
+            while len(cur) < 3:
+                cur.append(-1)
+            self.state[url] = cur
 
     @property
     def epoch(self) -> int:
         """Completed epochs = the minimum epoch across owned shards."""
-        return min(e for e, _ in self.state.values())
+        return min(v[0] for v in self.state.values())
 
     def _next_shard(self) -> str:
-        min_epoch = min(e for e, _ in self.state.values())
+        min_epoch = min(v[0] for v in self.state.values())
         candidates = [u for u in self.shard_urls if self.state[u][0] == min_epoch]
         if self.shuffle:
             order = sorted(candidates)
@@ -168,19 +173,68 @@ class ResumableShardReader:
         return idx
 
     def __iter__(self) -> Iterator[Row]:
+        # A shard that yields nothing (unreadable, empty, or fully consumed by
+        # a stale cursor) must not be able to stall the stream: _next_shard()
+        # is a pure function of the cursor table, so re-selecting the same
+        # failing shard forever is otherwise a livelock at zero throughput.
+        # Every shard is retired to the next epoch on the way out, and a full
+        # sweep with no rows at all is a hard error rather than a spin.
+        barren = 0
         while True:
             url = self._next_shard()
-            epoch, start_row = self.state[url]
-            scanner = self.scanner_type(url)
-            n = len(scanner)
+            # tolerate 2-element cursors (older releases, or state assigned
+            # directly rather than through the constructor)
+            cur = self.state[url]
+            if len(cur) < 3:                  # 2-element cursor: older release
+                cur = list(cur) + [-1] * (3 - len(cur))
+                self.state[url] = cur
+            epoch, start_row, known_n = cur
+            try:
+                scanner = self.scanner_type(url)
+                n = len(scanner)
+            except Exception as e:
+                logger.warning(f'skipping unreadable shard {url}: {e}')
+                self.state[url] = [epoch + 1, 0, known_n]
+                barren += 1
+                if barren >= len(self.shard_urls):
+                    raise RuntimeError(
+                        f'no shard produced a row in a full sweep over '
+                        f'{len(self.shard_urls)} shards — data source unusable'
+                    )
+                continue
+
+            if known_n >= 0 and known_n != n:
+                logger.warning(
+                    f'shard {url} has {n} rows but its cursor was recorded '
+                    f'against {known_n}; the row order is derived from the row '
+                    f'count, so the cursor no longer maps — replaying this '
+                    f'shard from the start of epoch {epoch}'
+                )
+                start_row = 0
+            elif start_row > n:
+                logger.warning(
+                    f'cursor for {url} points past its {n} rows — replaying '
+                    f'from the start of epoch {epoch}'
+                )
+                start_row = 0
+
             perm = self._row_perm(url, epoch, n)
+            produced = False
             for r in range(start_row, n):
                 # advance BEFORE yielding: a generator pauses at yield, so a
                 # post-yield update would miss the last delivered row in any
                 # snapshot taken while paused (off-by-one replay on resume)
                 self.state[url][1] = r + 1
+                self.state[url][2] = n
+                produced = True
                 yield scanner[perm[r]]
-            self.state[url] = [epoch + 1, 0]
+            self.state[url] = [epoch + 1, 0, n]
+            barren = 0 if produced else barren + 1
+            if barren >= len(self.shard_urls):
+                raise RuntimeError(
+                    f'no shard produced a row in a full sweep over '
+                    f'{len(self.shard_urls)} shards — data source unusable'
+                )
 
     def is_countable(self) -> bool:
         return False        # infinite by construction
@@ -233,8 +287,15 @@ class FlowIterator(Iterator[Row | RowMapFunctionError | RowFlowFunctionError]):
         self.map_fn = map_fn
         self.flow_fn = flow_fn
         self.allow_error = allow_error
+        # The flow is opened ONCE and kept: a flow function may buffer input
+        # rows and emit several rows per group (packing, windowing, splitting),
+        # and rebuilding it per __next__ would throw away everything it had
+        # already produced but not yet handed out. Measured on a pixel-LM
+        # packing flow that renders 8 windows per call: 8x the rendering work
+        # and 8x the rows pulled from the reader, for one row consumed.
+        self._flow: Iterator[Row] | None = None
 
-    def __next__(self) -> Row | RowMapFunctionError | RowFlowFunctionError:
+    def _open_flow(self) -> Iterator[Row]:
         def _map_stream(
             source: Iterator[Row], 
             map_fn: Callable[[Row], Row]
@@ -250,19 +311,27 @@ class FlowIterator(Iterator[Row | RowMapFunctionError | RowFlowFunctionError]):
                 except Exception as e:
                     raise RowMapFunctionError(f"Row mapping function failed: {e}")
 
-        it = iter(self.flow_fn(_map_stream(self.source, self.map_fn)))
+        return iter(self.flow_fn(_map_stream(self.source, self.map_fn)))
+
+    def __next__(self) -> Row | RowMapFunctionError | RowFlowFunctionError:
+        if self._flow is None:
+            self._flow = self._open_flow()
         try:
-            result = next(it)
-            return result
+            return next(self._flow)
         except StopIteration as e:
+            # a generator that raised is dead; the next call re-opens over the
+            # same (possibly still live) source
+            self._flow = None
             raise e
         except RowMapFunctionError as e:
+            self._flow = None
             if self.allow_error:
                 logger.warning(f'Ignore error in map function: {e}')
                 return e
             else:
                 raise e
         except Exception as e:
+            self._flow = None
             if self.allow_error:
                 logger.warning(f'Ignore error in flow function: {e}')
                 return RowFlowFunctionError(f"Row flow function failed: {e}")

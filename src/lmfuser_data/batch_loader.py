@@ -161,17 +161,23 @@ def _batch_worker_loop(
                 cursor = start + arr.nbytes
 
             slot = free_q.get()  # blocks when the ring is full (backpressure)
-            base = slot * slot_nbytes
-            for key, arr in arrays:
-                _, _, off = specs[key]
-                dst = np.ndarray(arr.shape, dtype=arr.dtype, buffer=shm.buf, offset=base + off)
-                np.copyto(dst, arr)
-            epoch = min(r.epoch for r in readers) if readers else 0
-            # cursor snapshot rides along with every batch (a few KB); the
-            # consumer keeps the latest per worker — saving that reproduces
-            # the stream up to this batch (in-flight reads are skipped, i.e.
-            # a resume loses at most the buffered windows, never repeats)
-            cursors = [r.snapshot() for r in readers]
+            try:
+                base = slot * slot_nbytes
+                for key, arr in arrays:
+                    _, _, off = specs[key]
+                    dst = np.ndarray(arr.shape, dtype=arr.dtype, buffer=shm.buf, offset=base + off)
+                    np.copyto(dst, arr)
+                epoch = min(r.epoch for r in readers) if readers else 0
+                # cursor snapshot rides along with every batch (a few KB); the
+                # consumer keeps the latest per worker — saving that reproduces
+                # the stream up to this batch (in-flight reads are skipped, i.e.
+                # a resume loses at most the buffered windows, never repeats)
+                cursors = [r.snapshot() for r in readers]
+            except BaseException:
+                # a slot acquired and never handed on is lost for the process
+                # lifetime; enough of those and every worker blocks on free_q
+                free_q.put(slot)
+                raise
             ready_q.put((slot, specs, objects, epoch, worker_id, cursors))
     except Exception:
         logger.exception(f'[batch-worker {worker_id}] fatal error, exiting')
@@ -236,10 +242,11 @@ class BatchDataLoader:
                     # already-consumed shards — a contiguous split could hand
                     # one consumer only exhausted shards, forcing it into the
                     # next epoch (replays) while others still hold fresh data
-                    order = sorted(
-                        lines,
-                        key=lambda u: (*table.get(u, [0, 0]), u),
-                    )
+                    def _progress(u: str) -> tuple:
+                        cur = table.get(u, [0, 0])
+                        return (cur[0], cur[1], u)   # epoch, rows consumed, url
+
+                    order = sorted(lines, key=_progress)
                     parts = [order[c::num_consumers] for c in range(num_consumers)]
                 else:
                     parts = split_list(lines, num_consumers)
@@ -287,6 +294,10 @@ class BatchDataLoader:
         self.worker_timeout = worker_timeout
         self.batch_size = batch_size
         self._epoch = 0
+        # liveness polling cadence on the happy path (is_alive() is a cheap
+        # waitpid; once per ring-depth of batches is plenty)
+        self._check_every = max(num_workers, 1)
+        self._since_check = 0
 
         # latest cursor snapshot per worker (payload of the last CONSUMED
         # batch) — the basis of state_dict()
@@ -319,14 +330,25 @@ class BatchDataLoader:
     def epoch(self) -> int:
         return self._epoch
 
+    def _check_workers(self) -> None:
+        """A dead worker takes its shard slice with it: the survivors keep the
+        queue full, so training continues on a silently shrunken corpus with a
+        skewed source mixture. Surface it instead."""
+        dead = [i for i, p in enumerate(self.workers) if not p.is_alive()]
+        if dead:
+            raise RuntimeError(
+                f'batch worker(s) {dead} died (exit codes '
+                f'{[self.workers[i].exitcode for i in dead]}) — their shards would '
+                f'never be read again; see the worker traceback in the logs'
+            )
+
     def __iter__(self) -> Iterator[Batch]:
         while True:
             try:
                 slot, specs, objects, ep, worker_id, cursors = \
                     self.ready_q.get(timeout=self.worker_timeout)
             except queue_mod.Empty:
-                if not any(p.is_alive() for p in self.workers):
-                    raise RuntimeError('all batch workers died — see worker logs')
+                self._check_workers()
                 raise TimeoutError(
                     f'no batch arrived within {self.worker_timeout}s '
                     f'({sum(p.is_alive() for p in self.workers)} workers alive)'
@@ -340,6 +362,10 @@ class BatchDataLoader:
             self.free_q.put(slot)
             self._epoch = max(self._epoch, ep)
             self._worker_cursors[worker_id] = cursors
+            self._since_check += 1
+            if self._since_check >= self._check_every:
+                self._since_check = 0
+                self._check_workers()
             yield batch
 
     def state_dict(self) -> dict[str, dict[str, list[int]]]:

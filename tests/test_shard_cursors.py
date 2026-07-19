@@ -137,7 +137,7 @@ def test_loader_resume_across_worker_counts() -> None:
     # in-flight loss, measured directly from the saved table: rows the cursors
     # advanced past minus rows actually consumed. Bound = shm ring (2 slots)
     # + per-worker assembly batch, x batch_size.
-    advanced = sum(e * 40 + r for t in state.values() for e, r in t.values())
+    advanced = sum(c[0] * 40 + c[1] for t in state.values() for c in t.values())
     lost = advanced - len(consumed_a)
     in_flight_bound = (2 + 3) * 8
     assert 0 <= lost <= in_flight_bound, \
