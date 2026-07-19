@@ -146,7 +146,17 @@ class DataLoader:
 
     @property
     def epoch(self) -> int:
-        return max([distributor.epoch for distributor in self.distributors])
+        """Completed epochs = the SLOWEST source's, not the fastest's.
+
+        `max` closed the epoch as soon as ANY one source had been round once,
+        so with sources of different sizes the smallest ended the epoch for
+        everybody and the largest was never covered: 18 rows across two
+        sources delivered 10, 12, 6 and 12 rows over four epochs, some rows
+        seen four times and others once. `min` means an epoch is over when
+        every source has been round at least once; small sources repeat
+        within it, which is what the mixing weights already imply.
+        """
+        return min([distributor.epoch for distributor in self.distributors])
 
     def __iter__(self) -> Iterator[Batch]:
         current_epoch = self.epoch

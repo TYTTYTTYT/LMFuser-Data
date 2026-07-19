@@ -473,6 +473,56 @@ def test_epoch_boundary_row_is_not_lost() -> None:
           '(3 exact shapes x 4 epochs, plus a non-dividing shape by multiset)')
 
 
+def test_multi_source_epoch_covers_every_source() -> None:
+    """An epoch must not end before the LARGEST source has been round once.
+
+    The loader took max() over its sources, so the smallest one closed the
+    epoch for everybody and the largest was never covered — 18 rows across two
+    sources delivered 10, 12, 6 and 12 rows over four epochs, some rows seen
+    four times and others once. min() means every source gets a full pass;
+    small sources repeat within the epoch, which is what the mixing weights
+    already imply.
+    """
+    import csv
+    import tempfile
+    from collections import Counter
+    from lmfuser_data.data_loader import DataLoader
+
+    tmp = tempfile.mkdtemp(prefix='multisrc_')
+    srcs = []
+    for name, n_shards, n_rows in (('A', 2, 3), ('B', 3, 4)):     # 6 rows vs 12
+        shards = []
+        for s in range(n_shards):
+            p = os.path.join(tmp, f'{name}{s}.csv')
+            with open(p, 'w', newline='') as fh:
+                w = csv.writer(fh)
+                w.writerow(['id'])
+                for i in range(n_rows):
+                    w.writerow([f'{name}{s}-{i}'])
+            shards.append(p)
+        sp = os.path.join(tmp, f'{name}.txt')
+        with open(sp, 'w') as fh:
+            fh.write('\n'.join(shards))
+        srcs.append(sp)
+
+    dl = DataLoader(batch_size=2, path_list=srcs, scanner_type='CSVScanner',
+                    seed=1, shuffle=False, pre_fetch_factor=0,
+                    instruct_timeout=30, worker_timeout=30)
+    big_seen = Counter()
+    for _ in range(3):
+        rows = [x for b in dl for x in b['id']]
+        big_seen.update(x for x in rows if x.startswith('B'))
+    # the large source must be fully covered, not truncated by the small one
+    assert len(big_seen) == 12, (
+        f'large source covered {len(big_seen)}/12 rows over three epochs — '
+        f'the small source is still closing the epoch early')
+    assert min(big_seen.values()) >= 2, (
+        f'some rows of the large source seen only {min(big_seen.values())}x '
+        f'in three epochs: {big_seen}')
+    print(f'PASS 18: large source fully covered ({len(big_seen)}/12), '
+          f'min exposure {min(big_seen.values())} over 3 epochs')
+
+
 if __name__ == '__main__':
     test_unreadable_shard_is_skipped()
     test_all_unreadable_raises()
@@ -491,4 +541,5 @@ if __name__ == '__main__':
     test_unreadable_plus_empty_does_not_spin()
     test_dead_shard_is_not_retried_every_visit()
     test_epoch_boundary_row_is_not_lost()
+    test_multi_source_epoch_covers_every_source()
     print('ALL PASS')
