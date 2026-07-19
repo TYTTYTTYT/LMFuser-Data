@@ -58,7 +58,7 @@ from .interfaces import Batch, Row
 from .scanners import Scanner
 from .data_operators import ResumableShardReader, DataFlow
 from .data_loader import _collate_fn
-from .utils import split_list
+from .utils import split_list, slowest_epoch
 
 logger = logging.getLogger(__name__)
 
@@ -352,6 +352,11 @@ class BatchDataLoader:
         self.worker_timeout = worker_timeout
         self.batch_size = batch_size
         self._epoch = 0
+        # Latest epoch reported by each worker. The loader's epoch is the
+        # SLOWEST of these — see slowest_epoch. A worker that has not reported
+        # yet counts as 0, which is exactly right: it has not finished its
+        # first pass.
+        self._worker_epochs: dict[int, int] = {w: 0 for w in range(num_workers)}
         # liveness polling cadence on the happy path (is_alive() is a cheap
         # waitpid; once per ring-depth of batches is plenty)
         self._check_every = max(num_workers, 1)
@@ -435,7 +440,14 @@ class BatchDataLoader:
                 batch[key] = torch.from_numpy(src.copy())   # one memcpy; slot freed below
             batch.update(objects)
             self.free_q.put(slot)
-            self._epoch = max(self._epoch, ep)
+            # `max` here let the FASTEST worker declare the epoch over for the
+            # whole loader: a 3-row shard beside a 400-row shard rolled the
+            # epoch after 4 batches with 0/400 rows of the large shard seen,
+            # and reached epoch 20 while the large shard was still untouched.
+            # This is the same defect 0.3.13 removed from the other three axes;
+            # this fourth one is the loader pretraining actually uses.
+            self._worker_epochs[worker_id] = ep
+            self._epoch = slowest_epoch(list(self._worker_epochs.values()))
             self._worker_cursors[worker_id] = cursors
             self._since_check += 1
             if self._since_check >= self._check_every:

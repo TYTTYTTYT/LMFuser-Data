@@ -160,6 +160,9 @@ def slowest_epoch(epochs: Sequence[int], weights: Sequence[float] | None = None)
     assert len(weights) == len(epochs), \
         f'{len(epochs)} epochs but {len(weights)} weights'
     live = [e for e, w in zip(epochs, weights) if w > 0]
-    # Every weight zero: nothing is drawn at all. Falling back to the plain
-    # minimum keeps the caller's stop condition reachable instead of hanging.
+    # Every weight zero is rejected by the caller at construction time (see
+    # DataLoader.__init__): nothing would ever be drawn, and `random.choices`
+    # raises an opaque "Total of weights must be greater than zero" the first
+    # time the stream is read. The plain minimum here is only a defensive
+    # fallback so this helper is total, not a supported configuration.
     return min(live) if live else min(epochs)

@@ -138,6 +138,12 @@ class DataLoader:
         else:
             assert len(self.distributors) == len(distributor_weights), \
                 "The number of distributors and weights must be the same."
+            # Caught here rather than at the first read, where `random.choices`
+            # raises "Total of weights must be greater than zero" from inside
+            # the mixing helper with no clue which loader was misconfigured.
+            assert any(w > 0 for w in distributor_weights), \
+                (f'every source weight is zero ({distributor_weights}), so no '
+                 f'source would ever be drawn from')
             self.distributor_weights = distributor_weights
 
         self.distributor_index = 0
